@@ -5,9 +5,9 @@ import os
 import requests
 import json
 import logging
-import pytz # ADDED: Library for timezone handling
+import pytz 
 
-# Set up basic logging (useful for debugging on Render)
+# Set up basic logging 
 logging.basicConfig(level=logging.INFO)
 
 # ---------------------------------------------
@@ -23,8 +23,6 @@ GOOGLE_SHEET_NAME = "Minute Tracker Data"
 
 # ==========================================================
 # *** 2. CRITICAL: LIST YOUR FRIENDS' USER IDs AND NAMES ***
-# Make sure these are the correct Roblox User IDs and not usernames.
-# NOTE: Using the placeholder IDs you provided for safety.
 # ==========================================================
 FRIENDS_TO_TRACK = {
     5120230728: "jsadujgha", 
@@ -35,8 +33,8 @@ FRIENDS_TO_TRACK = {
 
 # Roblox API Endpoint and Sheet Names
 ROBLOX_STATUS_URL = "https://presence.roblox.com/v1/presence/users"
-DATA_SHEET_NAME = "Activity Log"  # Must match the name of your main logging tab
-CACHE_SHEET_NAME = "Cache"       # Must match the name of your cache tab
+DATA_SHEET_NAME = "Activity Log"  
+CACHE_SHEET_NAME = "Cache"       
 
 # ---------------------------------------------
 # 2. HELPER FUNCTIONS (GOOGLE SHEET CACHE)
@@ -45,23 +43,21 @@ CACHE_SHEET_NAME = "Cache"       # Must match the name of your cache tab
 def get_cached_status(worksheet):
     """Reads the last known status from the Cache sheet (Cell A2)."""
     try:
-        # Get the JSON string from the cache sheet (always cell A2)
         json_str = worksheet.acell('A2').value
         if json_str and json_str.strip() not in ('{}', ''):
             return json.loads(json_str)
     except Exception as e:
         logging.error(f"Error loading cache from Sheet: {e}")
         
-    # Initialize cache if the value is empty or broken
     default_state = {"playing": False, "game_name": "N/A", "start_time": None}
     return {uid: default_state for uid in FRIENDS_TO_TRACK}
 
 def save_cached_status(worksheet, status_data):
-    """Writes the current status to the Cache sheet (Cell A2)."""
+    """Writes the current status to the Cache sheet (Cell A2) using the correct list-of-lists format."""
     try:
         json_str = json.dumps(status_data)
-        # Update the cache cell (A2) with the new JSON string
-        worksheet.update('A2', json_str)
+        # CRITICAL FIX: Use list of lists format for single cell update
+        worksheet.update('A2', [[json_str]])
     except Exception as e:
         logging.error(f"Error saving cache to Sheet: {e}")
 
@@ -77,11 +73,7 @@ def check_roblox_status(user_ids):
         current_status = {}
         for item in presence:
             uid = item['userId']
-            # userPresenceType 1 or 2 means they are online/playing
             is_playing = item['userPresenceType'] in [1, 2] 
-            
-            # CRITICAL FIX: Get lastLocation which contains the game name
-            # If not playing, or lastLocation is empty, set it to "N/A"
             game_name = item.get('lastLocation') if is_playing and item.get('lastLocation') else "N/A"
             
             current_status[uid] = {
@@ -96,19 +88,17 @@ def check_roblox_status(user_ids):
 # ---------------------------------------------
 # 3. THE MAIN TRACKING LOGIC
 # ---------------------------------------------
-def run_tracking_logic():
+def execute_tracking():
     # --- Connect to Google Sheets ---
     try:
         creds_json = os.environ.get('GOOGLE_CREDENTIALS')
         if not creds_json:
             return "ERROR: GOOGLE_CREDENTIALS environment variable is missing."
         
-        # Load the key securely from the environment variable
         gc = gspread.service_account_from_dict(json.loads(creds_json)) 
         
         spreadsheet = gc.open(GOOGLE_SHEET_NAME)
         
-        # Explicitly open the worksheets by name
         data_worksheet = spreadsheet.worksheet(DATA_SHEET_NAME) 
         cache_worksheet = spreadsheet.worksheet(CACHE_SHEET_NAME)
         
@@ -126,10 +116,16 @@ def run_tracking_logic():
     new_cache = {}
     logs_to_write = []
     
-    # --- TIMEZONE FIX: Convert UTC time to IST ---
-    ist = pytz.timezone('Asia/Kolkata')
-    current_time_dt = datetime.datetime.now(ist)
-    timestamp_str = current_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+    # --- TIMEZONE FIX: Convert time to IST ---
+    try:
+        ist = pytz.timezone('Asia/Kolkata')
+        current_time_dt = datetime.datetime.now(ist)
+        timestamp_str = current_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+    except NameError:
+        current_time_dt = datetime.datetime.now()
+        timestamp_str = current_time_dt.strftime("%Y-%m-%d %H:%M:%S (UTC/Server Time)")
+        logging.error("Pytz not found. Check requirements.txt.")
+        
 
     # --- COMPARE AND LOG CHANGES ---
     for uid, friend_name in FRIENDS_TO_TRACK.items():
@@ -139,22 +135,21 @@ def run_tracking_logic():
         current_game_name = current['game_name']
         cached_game_name = cached['game_name']
 
-        # Prepare data for the new cache
+        # --- Prepare data for the new cache ---
         new_cache[uid] = {
             "playing": current['playing'], 
             "game_name": current_game_name, 
             "start_time": cached['start_time']
         }
 
-        # 1. STARTED PLAYING
+        # 1. STARTED PLAYING (OFFLINE -> ONLINE)
         if not cached['playing'] and current['playing']:
             action = "STARTED PLAYING"
             game = current_game_name
-            # Log the entry with the game name (D=game, E=duration)
             logs_to_write.append([timestamp_str, friend_name, action, game, ""]) 
             new_cache[uid]["start_time"] = timestamp_str
 
-        # 2. STOPPED PLAYING
+        # 2. STOPPED PLAYING (ONLINE -> OFFLINE)
         elif cached['playing'] and not current['playing']:
             action = "STOPPED PLAYING"
             game = cached_game_name # Log the game they stopped playing
@@ -162,48 +157,25 @@ def run_tracking_logic():
             
             if cached['start_time']:
                 try:
-                    # NOTE: cached start_time is treated as IST for duration calculation
                     start_time_dt = datetime.datetime.strptime(cached['start_time'], "%Y-%m-%d %H:%M:%S")
-                    
-                    # Convert start_time_dt to be timezone-aware (as IST) 
-                    # before calculating duration with timezone-aware current_time_dt
-                    start_time_dt_aware = ist.localize(start_time_dt)
+                    ist_tz = pytz.timezone('Asia/Kolkata')
+                    start_time_dt_aware = ist_tz.localize(start_time_dt)
                     
                     duration = current_time_dt - start_time_dt_aware
                     duration_minutes = round(duration.total_seconds() / 60, 2)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.error(f"Error calculating duration for {friend_name}: {e}")
             
-            # Log the entry with the duration
             logs_to_write.append([timestamp_str, friend_name, action, game, duration_minutes])
             new_cache[uid]["start_time"] = None
             
-        # 3. GAME CHANGED
+        # 3. If currently playing and the game changed: 
+        #    We only update the cache's game name and reset the start time, but DO NOT log the event.
         elif current['playing'] and cached['playing'] and current_game_name != cached_game_name:
-            
-            # Log STOP for the old game
-            old_game = cached_game_name
-            duration_minutes = ""
-            if cached['start_time']:
-                try:
-                    start_time_dt = datetime.datetime.strptime(cached['start_time'], "%Y-%m-%d %H:%M:%S")
-                    start_time_dt_aware = ist.localize(start_time_dt)
-                    
-                    duration = current_time_dt - start_time_dt_aware
-                    duration_minutes = round(duration.total_seconds() / 60, 2)
-                except Exception:
-                    pass
-
-            logs_to_write.append([timestamp_str, friend_name, "STOPPED PLAYING", old_game, duration_minutes])
-            
-            # Log START for the new game
-            new_game = current_game_name
-            logs_to_write.append([timestamp_str, friend_name, "STARTED PLAYING", new_game, ""])
-            
-            # Update cache with new start time
             new_cache[uid]["start_time"] = timestamp_str
             
-        # 4. If currently playing and no change, keep the old start_time in the cache
+        # 4. If currently playing, no change in status, and game didn't change: 
+        #    We preserve the original start_time from the cache (which is done automatically above).
         elif current['playing']:
             new_cache[uid]["start_time"] = cached['start_time']
 
@@ -217,12 +189,19 @@ def run_tracking_logic():
     return f"SUCCESS: Checked {len(FRIENDS_TO_TRACK)} friends. {len(logs_to_write)} new events logged."
     
 # ---------------------------------------------
-# 4. WEB ROUTE AND APP RUNNER
+# 4. WEB ROUTES
 # ---------------------------------------------
-@app.route('/')
-def index():
-    result = run_tracking_logic()
+
+# This is the primary route that runs the script (used by your external scheduler)
+@app.route('/track')
+def track():
+    result = execute_tracking()
     return result
+
+# This is the new, empty route used by Render's health check
+@app.route('/')
+def health_check():
+    return "OK"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
