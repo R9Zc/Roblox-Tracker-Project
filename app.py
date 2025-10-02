@@ -208,25 +208,3 @@ if __name__ == '__main__':
 ```eof
 
 ---
-
-## 2. Configure Render Health Check Path
-
-To stop the 1-minute logging you saw, you must point Render's internal check to the new, empty `/` route:
-
-1.  Go to your **Render Dashboard** and select your web service.
-2.  Go to the **"Settings"** tab.
-3.  Ensure the **"Health Check Path"** field is set to the default: **`/`**.
-4.  **Save Changes.**
-
----
-
-## 3. Set up the Cron-Job.org Scheduler
-
-This is the final step to make it run every minute.
-
-1.  Go to **Cron-Job.org** and log in.
-2.  Create a **New Cronjob**.
-3.  **Address (URL):** Paste your full tracking URL: `https://roblox-tracker-project.onrender.com/track`
-4.  **Schedule:** Select **"Every 1 minute(s)"**.
-
-You are now all set! The service will check Roblox every minute, but your Google Sheet will only log an entry when someone starts or stops playing, including the correct Game Name in both entries.
