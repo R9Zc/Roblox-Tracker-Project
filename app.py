@@ -56,7 +56,6 @@ def save_cached_status(worksheet, status_data):
     """Writes the current status to the Cache sheet (Cell A2) using the correct list-of-lists format."""
     try:
         json_str = json.dumps(status_data)
-        # CRITICAL FIX: Use list of lists format for single cell update
         worksheet.update('A2', [[json_str]])
     except Exception as e:
         logging.error(f"Error saving cache to Sheet: {e}")
@@ -152,7 +151,7 @@ def execute_tracking():
         # 2. STOPPED PLAYING (ONLINE -> OFFLINE)
         elif cached['playing'] and not current['playing']:
             action = "STOPPED PLAYING"
-            game = cached_game_name # Log the game they stopped playing
+            game = cached_game_name 
             duration_minutes = ""
             
             if cached['start_time']:
@@ -170,12 +169,12 @@ def execute_tracking():
             new_cache[uid]["start_time"] = None
             
         # 3. If currently playing and the game changed: 
-        #    We only update the cache's game name and reset the start time, but DO NOT log the event.
+        #    We update the cache but DO NOT log the event.
         elif current['playing'] and cached['playing'] and current_game_name != cached_game_name:
             new_cache[uid]["start_time"] = timestamp_str
             
         # 4. If currently playing, no change in status, and game didn't change: 
-        #    We preserve the original start_time from the cache (which is done automatically above).
+        #    We preserve the original start_time.
         elif current['playing']:
             new_cache[uid]["start_time"] = cached['start_time']
 
@@ -206,3 +205,28 @@ def health_check():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+```eof
+
+---
+
+## 2. Configure Render Health Check Path
+
+To stop the 1-minute logging you saw, you must point Render's internal check to the new, empty `/` route:
+
+1.  Go to your **Render Dashboard** and select your web service.
+2.  Go to the **"Settings"** tab.
+3.  Ensure the **"Health Check Path"** field is set to the default: **`/`**.
+4.  **Save Changes.**
+
+---
+
+## 3. Set up the Cron-Job.org Scheduler
+
+This is the final step to make it run every minute.
+
+1.  Go to **Cron-Job.org** and log in.
+2.  Create a **New Cronjob**.
+3.  **Address (URL):** Paste your full tracking URL: `https://roblox-tracker-project.onrender.com/track`
+4.  **Schedule:** Select **"Every 1 minute(s)"**.
+
+You are now all set! The service will check Roblox every minute, but your Google Sheet will only log an entry when someone starts or stops playing, including the correct Game Name in both entries.
