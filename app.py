@@ -23,14 +23,14 @@ GOOGLE_SHEET_NAME = "Minute Tracker Data"
 
 # ==========================================================
 # *** 2. CRITICAL: LIST YOUR FRIENDS' USER IDs AND NAMES ***
-# *** V11 FIX: INCLUDING HULK_BUSTER9402 ***
+# *** V13 FIX: CORRECTED ID FOR HULK_BUSTER9402 (1992158202) ***
 # ==========================================================
 FRIENDS_TO_TRACK = {
     5120230728: "jsadujgha", 
     4491738101: "NOTKRZEN", 
     3263707365: "Cyrus_STORM",
-    # Based on the logs, adding the fourth user ID and name:
-    5188846313: "hulk_buster9402", 
+    # FINAL CORRECTED ID for your user
+    1992158202: "hulk_buster9402", 
 }
 # ==========================================================
 
@@ -77,7 +77,7 @@ def check_roblox_status(user_ids):
         for item in presence:
             uid = item['userId']
             
-            # V11: ALL status types except Offline (0) are considered 'playing'. 
+            # V13: ALL status types except Offline (0) are considered 'playing'. 
             is_playing = item['userPresenceType'] in [1, 2, 3] 
             user_presence_type = item['userPresenceType'] 
             
