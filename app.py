@@ -28,6 +28,9 @@ FRIENDS_TO_TRACK = {
     5120230728: "jsadujgha", 
     4491738101: "NOTKRZEN", 
     3263707365: "Cyrus_STORM",
+    # --- START OF NEW FRIEND ---
+    1992158202: "hulk_buster9402", # <-- Replace the ID and Name here!
+    # --- END OF NEW FRIEND ---
 }
 # ==========================================================
 
@@ -121,6 +124,7 @@ def execute_tracking():
         return f"ERROR: Google Sheets connection failed. Details: {e}"
 
     # Get cached and current status
+    # NOTE: get_cached_status is smart enough to handle new friends not in the cache
     cached_status = get_cached_status(cache_worksheet)
     current_roblox_status = check_roblox_status(FRIENDS_TO_TRACK.keys())
     
@@ -202,6 +206,7 @@ def execute_tracking():
     if logs_to_write:
         data_worksheet.append_rows(logs_to_write)
     
+    # NOTE: This ensures the new friend is added to the cache with default "Offline" status
     save_cached_status(cache_worksheet, new_cache)
 
     return f"SUCCESS: Checked {len(FRIENDS_TO_TRACK)} friends. {len(logs_to_write)} new events logged."
