@@ -73,54 +73,46 @@ def check_roblox_status(user_ids):
         presence = response.json().get('userPresences', [])
         current_status = {}
         
-        # --- NEW: DEBUG LOGGING TO RENDER CONSOLE ---
-        debug_log = "API Status received:"
+        # --- V16: API Debug Logging to Render Console ---
+        api_debug_log = "API Raw Status:"
         # -------------------------------------------
         
         for item in presence:
             uid = item['userId']
             
-            # V15: ALL status types except Offline (0) are considered 'playing'. 
+            # V16: ALL status types except Offline (0) are considered 'playing'. 
             is_playing = item['userPresenceType'] in [1, 2, 3] 
             user_presence_type = item['userPresenceType'] 
             
             # --- Game Data Handling ---
-            # V15 FIX: Explicitly check for None
-            place_id = item.get('placeId') # Get placeId, which might be None, 0, or a large number.
-            
-            # Use 0 if it's None or the value is missing, otherwise use the received number.
-            # We explicitly check for None later in the logic.
+            # V16: Handle 'None' explicitly, default to 0 for tracking logic
+            place_id = item.get('placeId') 
             place_id_for_cache = place_id if place_id is not None else 0 
             
-            # Determine if they are in a real game (Must be Playing AND Place ID must be > 0)
+            # Determine if they are in a real game 
             is_in_real_game = is_playing and place_id_for_cache != 0
 
             if user_presence_type == 0:
-                # Truly offline
                 display_game_name = "Offline"
             elif is_playing:
-                # If online (Type 1, 2, or 3)
                 if is_in_real_game:
-                    # They are in a real place/game
                     display_game_name = f"Game ID: {place_id_for_cache}" 
                 else:
-                    # They are on the website or just online
-                    # NOTE: This covers the "Playing=True, PlaceID=None" scenario for logging
                     display_game_name = "Website/Online"
             else:
-                display_game_name = "Unknown" # Fallback
+                display_game_name = "Unknown" 
 
             current_status[uid] = {
                 "playing": is_playing, 
-                "game_name": display_game_name, # Use display name for the cache/log
-                "place_id": place_id_for_cache # Store 0 or the actual ID
+                "game_name": display_game_name, 
+                "place_id": place_id_for_cache
             }
             
-            # --- NEW: DEBUG LOGGING TO RENDER CONSOLE (Shows actual API response values) ---
-            debug_log += f" | {FRIENDS_TO_TRACK.get(uid, uid)} (ID: {uid}): Playing={is_playing}, PlaceID={place_id}"
+            # --- V16: API Debug Logging (Shows actual API response values) ---
+            api_debug_log += f" | {FRIENDS_TO_TRACK.get(uid, uid)} (ID: {uid}): Playing={is_playing}, PlaceID={place_id}"
             # -------------------------------------------
             
-        logging.info(debug_log)
+        logging.info(api_debug_log)
         return current_status
     except Exception as e:
         logging.error(f"Roblox API check failed: {e}")
@@ -157,15 +149,14 @@ def execute_tracking():
     new_cache = {}
     logs_to_write = []
     
-    # --- TIME HANDLING: Use UTC for internal caching and IST for logging ---
+    # --- TIME HANDLING ---
     try:
         ist_tz = pytz.timezone('Asia/Kolkata')
         current_time_utc = datetime.datetime.now(pytz.utc)
         current_time_ist = current_time_utc.astimezone(ist_tz)
         timestamp_log_str = current_time_ist.strftime("%Y-%m-%d %H:%M:%S")
-        timestamp_cache_str = current_time_utc.strftime("%Y-%m-%d %H:%M:%S+00:00") # UTC format for cache
+        timestamp_cache_str = current_time_utc.strftime("%Y-%m-%d %H:%M:%S+00:00")
     except Exception:
-        # Fallback if pytz is missing
         current_time_utc = datetime.datetime.now(datetime.timezone.utc)
         timestamp_log_str = current_time_utc.strftime("%Y-%m-%d %H:%M:%S (UTC)")
         timestamp_cache_str = current_time_utc.strftime("%Y-%m-%d %H:%M:%S+00:00")
@@ -173,43 +164,43 @@ def execute_tracking():
 
     # --- COMPARE AND LOG CHANGES ---
     for uid, friend_name in FRIENDS_TO_TRACK.items():
-        # Fallback for missing keys in old cache
         cached_default = {"playing": False, "game_name": "Offline", "start_time_utc": None, "place_id": 0}
         cached = cached_status.get(uid, cached_default)
-        
         current = current_roblox_status.get(uid, {"playing": False, "game_name": "Offline", "place_id": 0})
         
-        # Start with the cached state for the next cache update
         new_cache[uid] = cached.copy()
         
-        # Determine if the user is in a state with a game ID
-        # LOGIC IS BASED ON place_id != 0, which is the reliable marker for a real game.
+        # Determine if the user is in a state with a non-zero place ID
         cached_in_game_id = cached['playing'] and cached['place_id'] != 0
         current_in_game_id = current['playing'] and current['place_id'] != 0
+        
+        # --- V16: Internal Logic Debug Log ---
+        log_message = f"[{friend_name}] Cache State: playing={cached['playing']}, pID={cached['place_id']} | Current State: playing={current['playing']}, pID={current['place_id']}"
+        # -------------------------------------
+
 
         # 1. STARTED PLAYING A REAL GAME (No Game ID -> Has Game ID)
         if not cached_in_game_id and current_in_game_id:
             action = "STARTED PLAYING"
-            game = current['game_name'] # Will be "Game ID: XXX"
+            game = current['game_name']
             logs_to_write.append([timestamp_log_str, friend_name, action, game, ""]) 
             
-            # UPDATE NEW CACHE STATE: Log the start time, playing=True, and the game ID
             new_cache[uid]["playing"] = True
             new_cache[uid]["game_name"] = current['game_name']
             new_cache[uid]["place_id"] = current['place_id']
             new_cache[uid]["start_time_utc"] = timestamp_cache_str
+            logging.info(log_message + " -> LOGGING START (Path 1)") # V16 Debug Log
 
         # 2. STOPPED PLAYING A REAL GAME (Has Game ID -> No Game ID OR Offline)
         elif cached_in_game_id and not current_in_game_id:
             action = "STOPPED PLAYING"
-            game = cached['game_name'] # Use cached name (Game ID: XXX) for the log
+            game = cached['game_name']
             duration_minutes = ""
             
             if cached['start_time_utc']:
                 try:
                     start_time_utc_dt = datetime.datetime.strptime(cached['start_time_utc'], "%Y-%m-%d %H:%M:%S+00:00")
                     start_time_utc_aware = pytz.utc.localize(start_time_utc_dt)
-                    
                     duration = current_time_utc.replace(tzinfo=pytz.utc) - start_time_utc_aware
                     duration_minutes = round(duration.total_seconds() / 60, 2)
                 except Exception as e:
@@ -217,43 +208,44 @@ def execute_tracking():
             
             logs_to_write.append([timestamp_log_str, friend_name, action, game, duration_minutes])
             
-            # UPDATE NEW CACHE STATE: Reset tracking data
             new_cache[uid]["playing"] = current['playing']
-            new_cache[uid]["game_name"] = current['game_name'] # Set name to 'Website/Online' or 'Offline'
-            new_cache[uid]["place_id"] = current['place_id'] # Store the new place_id (0)
+            new_cache[uid]["game_name"] = current['game_name']
+            new_cache[uid]["place_id"] = current['place_id']
             new_cache[uid]["start_time_utc"] = None
+            logging.info(log_message + " -> LOGGING STOP (Path 2)") # V16 Debug Log
 
         # 3. GAME CHANGED (While playing A game)
-        # Check if they are still in a game ID state AND the place ID changed
         elif cached_in_game_id and current_in_game_id and current['place_id'] != cached['place_id']:
             # Log the stop of the old game and the start of the new one
             # STOP LOG
             stop_action = "STOPPED PLAYING"
             stop_game = cached['game_name']
-            stop_duration = "" # We will not calculate duration here for simplicity in a game-switch log
-            logs_to_write.append([timestamp_log_str, friend_name, stop_action, stop_game, stop_duration])
+            logs_to_write.append([timestamp_log_str, friend_name, stop_action, stop_game, ""]) # No duration for switch
 
             # START LOG
             start_action = "STARTED PLAYING"
             start_game = current['game_name']
             logs_to_write.append([timestamp_log_str, friend_name, start_action, start_game, ""])
             
-            # UPDATE NEW CACHE STATE (Set up for the new game)
             new_cache[uid]["game_name"] = current['game_name']
             new_cache[uid]["place_id"] = current['place_id']
             new_cache[uid]["start_time_utc"] = timestamp_cache_str
-            
+            logging.info(log_message + " -> LOGGING GAME SWITCH (Path 3)") # V16 Debug Log
+
         # 4. Website/Online State Flip (No log, but update cache to reflect current status)
         elif not cached_in_game_id and not current_in_game_id:
-            # If they are both outside of a Game ID, just update the name/status 
-            # (e.g., flip from Offline to Website/Online) without logging.
+            # Update cache to flip between Offline, Website/Online, etc., silently
             new_cache[uid]["playing"] = current['playing']
             new_cache[uid]["game_name"] = current['game_name']
             new_cache[uid]["place_id"] = current['place_id']
+            # We don't log the start_time here because it's not a real game.
+            logging.info(log_message + " -> SILENT CACHE UPDATE (Path 4)") # V16 Debug Log
         
-        # 5. Otherwise, no meaningful change to track.
-
-
+        # 5. Otherwise, no meaningful change to track (Still in the same game, or still Offline/Website)
+        else:
+            # V16 Debug Log
+            logging.info(log_message + " -> NO CHANGE (Path 5)")
+            
     # --- WRITE LOGS AND SAVE CACHE ---
     if logs_to_write:
         data_worksheet.append_rows(logs_to_write)
