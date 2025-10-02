@@ -22,6 +22,7 @@ GOOGLE_SHEET_NAME = "Minute Tracker Data"
 
 # ==========================================================
 # *** 2. CRITICAL: LIST YOUR FRIENDS' USER IDs AND NAMES ***
+# Make sure these are the correct Roblox User IDs and not usernames.
 # ==========================================================
 FRIENDS_TO_TRACK = {
     5120230728: "jsadujgha", 
@@ -93,18 +94,25 @@ def check_roblox_status(user_ids):
 def run_tracking_logic():
     # --- Connect to Google Sheets ---
     try:
-        # Connect to Google Sheets service using credentials.json
+        # Connect to Google Sheets service using the GOOGLE_CREDENTIALS environment variable
         creds_json = os.environ.get('GOOGLE_CREDENTIALS')
-creds_json = os.environ.get('GOOGLE_CREDENTIALS')
-gc = gspread.service_account_from_dict(json.loads(creds_json))
+        if not creds_json:
+            return "ERROR: GOOGLE_CREDENTIALS environment variable is missing."
         
-        # *** THE FIX: Explicitly open the worksheets by name ***
+        # This line loads the key securely from the environment variable
+        gc = gspread.service_account_from_dict(json.loads(creds_json)) 
+        
+        spreadsheet = gc.open(GOOGLE_SHEET_NAME)
+        
+        # Explicitly open the worksheets by name
         data_worksheet = spreadsheet.worksheet(DATA_SHEET_NAME) 
         cache_worksheet = spreadsheet.worksheet(CACHE_SHEET_NAME)
-        # ---------------------------------------------------
         
     except Exception as e:
         logging.error(f"Google Sheets connection failed: {e}")
+        # Note: If this fails, the error is likely due to an issue with the 
+        # GOOGLE_CREDENTIALS variable content or not having shared the sheet 
+        # with the service account email.
         return f"ERROR: Google Sheets connection failed. Details: {e}"
 
     # Get cached and current status
@@ -203,5 +211,3 @@ def index():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
-
-
