@@ -23,11 +23,14 @@ GOOGLE_SHEET_NAME = "Minute Tracker Data"
 
 # ==========================================================
 # *** 2. CRITICAL: LIST YOUR FRIENDS' USER IDs AND NAMES ***
+# *** V11 FIX: INCLUDING HULK_BUSTER9402 ***
 # ==========================================================
 FRIENDS_TO_TRACK = {
     5120230728: "jsadujgha", 
     4491738101: "NOTKRZEN", 
     3263707365: "Cyrus_STORM",
+    # Based on the logs, adding the fourth user ID and name:
+    5188846313: "hulk_buster9402", 
 }
 # ==========================================================
 
@@ -74,8 +77,8 @@ def check_roblox_status(user_ids):
         for item in presence:
             uid = item['userId']
             
-            # V9 FIX: ONLY track In Game (1) and In Studio (2) as "playing" to control logs.
-            is_playing = item['userPresenceType'] in [1, 2] 
+            # V11: ALL status types except Offline (0) are considered 'playing'. 
+            is_playing = item['userPresenceType'] in [1, 2, 3] 
             user_presence_type = item['userPresenceType'] 
             
             # --- Game Data Handling (Prioritize Place ID) ---
@@ -85,15 +88,14 @@ def check_roblox_status(user_ids):
             if user_presence_type == 0:
                 # Truly offline
                 game_name = "Offline" 
-            elif user_presence_type == 3:
-                # On the website. Use "Website" or existing name.
-                game_name = "Website" if not game_name or game_name.strip() in ("", "N/A") else game_name
             elif is_playing:
-                # If playing a real game (Type 1 or 2)
+                # If online (Type 1, 2, or 3)
                 if place_id and place_id != 0:
-                    game_name = f"Game ID: {place_id}" # Log Game ID as the Name
-                elif not game_name or game_name.strip() == "":
-                    game_name = "N/A - Playing" # Fallback if ID is zero and name is empty
+                    # They are in a real place/game
+                    game_name = f"Game ID: {place_id}" 
+                else:
+                    # They are on the website or just online
+                    game_name = "Website/Online"
 
             current_status[uid] = {
                 "playing": is_playing, 
@@ -152,37 +154,35 @@ def execute_tracking():
 
     # --- COMPARE AND LOG CHANGES ---
     for uid, friend_name in FRIENDS_TO_TRACK.items():
-        # Fallback for missing place_id in old cache
+        # Fallback for missing keys in old cache
         cached_default = {"playing": False, "game_name": "Offline", "start_time_utc": None, "place_id": 0}
         cached = cached_status.get(uid, cached_default)
         
         current = current_roblox_status.get(uid, {"playing": False, "game_name": "Offline", "place_id": 0})
         
-        current_game_name = current['game_name']
-        cached_game_name = cached['game_name']
-        
-        # Start with the current cached state for the next cache update
+        # Start with the cached state for the next cache update
         new_cache[uid] = cached.copy()
+        
+        # Determine if the user is in a state with a game ID
+        cached_in_game_id = cached['playing'] and cached['place_id'] != 0
+        current_in_game_id = current['playing'] and current['place_id'] != 0
 
-        # 1. STARTED PLAYING (OFFLINE/WEBSITE -> IN REAL GAME/STUDIO)
-        # Check if they were NOT playing and are now playing
-        if not cached['playing'] and current['playing']:
+        # 1. STARTED PLAYING A REAL GAME (No Game ID -> Has Game ID)
+        if not cached_in_game_id and current_in_game_id:
             action = "STARTED PLAYING"
-            game = current_game_name
+            game = current['game_name'] # Will be "Game ID: XXX"
             logs_to_write.append([timestamp_log_str, friend_name, action, game, ""]) 
             
-            # UPDATE NEW CACHE STATE
+            # UPDATE NEW CACHE STATE: Log the start time, playing=True, and the game ID
             new_cache[uid]["playing"] = True
-            new_cache[uid]["game_name"] = current_game_name
+            new_cache[uid]["game_name"] = current['game_name']
             new_cache[uid]["place_id"] = current['place_id']
             new_cache[uid]["start_time_utc"] = timestamp_cache_str
 
-        # 2. STOPPED PLAYING (IN REAL GAME/STUDIO -> OFFLINE/WEBSITE)
-        # Check if they were playing AND are now NOT playing
-        # V9 FIX: Check if the cached place_id was > 0 to ensure it was a real game being tracked
-        elif cached['playing'] and cached['place_id'] > 0 and not current['playing']:
+        # 2. STOPPED PLAYING A REAL GAME (Has Game ID -> No Game ID OR Offline)
+        elif cached_in_game_id and not current_in_game_id:
             action = "STOPPED PLAYING"
-            game = cached_game_name # Use cached game name (Game ID: XXX) for the log
+            game = cached['game_name'] # Use cached name (Game ID: XXX) for the log
             duration_minutes = ""
             
             if cached['start_time_utc']:
@@ -197,26 +197,41 @@ def execute_tracking():
             
             logs_to_write.append([timestamp_log_str, friend_name, action, game, duration_minutes])
             
-            # UPDATE NEW CACHE STATE
-            new_cache[uid]["playing"] = False
-            new_cache[uid]["game_name"] = current_game_name # Set name to 'Offline' or 'Website'
-            new_cache[uid]["place_id"] = current['place_id'] # Store the new place_id (likely 0)
+            # UPDATE NEW CACHE STATE: Reset tracking data
+            new_cache[uid]["playing"] = current['playing']
+            new_cache[uid]["game_name"] = current['game_name'] # Set name to 'Website/Online' or 'Offline'
+            new_cache[uid]["place_id"] = current['place_id'] # Store the new place_id (0)
             new_cache[uid]["start_time_utc"] = None
 
-        # 3. GAME CHANGED (While still playing A game)
-        # Check if they are still playing AND the place ID changed (more reliable than name)
-        elif cached['playing'] and current['playing'] and current['place_id'] != cached['place_id'] and current['place_id'] != 0:
-            # We don't log a stop/start, but we update the cached game name and place ID
-            new_cache[uid]["game_name"] = current_game_name
-            new_cache[uid]["place_id"] = current['place_id']
+        # 3. GAME CHANGED (While playing A game)
+        # Check if they are still in a game ID state AND the place ID changed
+        elif cached_in_game_id and current_in_game_id and current['place_id'] != cached['place_id']:
+            # Log the stop of the old game and the start of the new one
+            # STOP LOG
+            stop_action = "STOPPED PLAYING"
+            stop_game = cached['game_name']
+            stop_duration = "" # We will not calculate duration here for simplicity in a game-switch log
+            logs_to_write.append([timestamp_log_str, friend_name, stop_action, stop_game, stop_duration])
+
+            # START LOG
+            start_action = "STARTED PLAYING"
+            start_game = current['game_name']
+            logs_to_write.append([timestamp_log_str, friend_name, start_action, start_game, ""])
             
-        # 4. Website/Offline flip: No change to logging, but update the cache name/ID (place_id will be 0)
-        elif not cached['playing'] and not current['playing'] and (current_game_name != cached_game_name or current['place_id'] != cached['place_id']):
-            # This handles the flip between "Offline" and "Website" without logging.
-            new_cache[uid]["game_name"] = current_game_name
+            # UPDATE NEW CACHE STATE (Set up for the new game)
+            new_cache[uid]["game_name"] = current['game_name']
+            new_cache[uid]["place_id"] = current['place_id']
+            new_cache[uid]["start_time_utc"] = timestamp_cache_str
+            
+        # 4. Website/Online State Flip (No log, but update cache to reflect current status)
+        elif not cached_in_game_id and not current_in_game_id:
+            # If they are both outside of a Game ID, just update the name/status 
+            # (e.g., flip from Offline to Website/Online) without logging.
+            new_cache[uid]["playing"] = current['playing']
+            new_cache[uid]["game_name"] = current['game_name']
             new_cache[uid]["place_id"] = current['place_id']
         
-        # 5. Otherwise, no meaningful change. Cached state is preserved.
+        # 5. Otherwise, no meaningful change to track.
 
 
     # --- WRITE LOGS AND SAVE CACHE ---
