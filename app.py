@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
 # ==========================================================
-# *** 1. CRITICAL: REPLACE THIS WITH YOUR EXACT SHEET NAME ***
+# *** 1. CRITICAL: REPLACE THIS WITH YOUR EXACT SPREADSHEET NAME ***
 # ==========================================================
 GOOGLE_SHEET_NAME = "Minute Tracker Data" 
 # ==========================================================
@@ -30,41 +30,37 @@ FRIENDS_TO_TRACK = {
 }
 # ==========================================================
 
-# Roblox API Endpoint and Environment Variable Key
+# Roblox API Endpoint and Sheet Names
 ROBLOX_STATUS_URL = "https://presence.roblox.com/v1/presence/users"
-CACHE_ENV_KEY = "ROBLOX_CACHE" # The name of the environment variable
+DATA_SHEET_NAME = "Activity Log"  # Must match the name of your main logging tab
+CACHE_SHEET_NAME = "Cache"       # Must match the name of your cache tab
 
 # ---------------------------------------------
-# 2. HELPER FUNCTIONS (NOW USING ENVIRONMENT VARIABLES)
+# 2. HELPER FUNCTIONS (GOOGLE SHEET CACHE)
 # ---------------------------------------------
 
-def get_cached_status():
-    """Reads the last known status from the ROBLOX_CACHE environment variable."""
-    # Get the raw JSON string from the environment variable
-    json_str = os.environ.get(CACHE_ENV_KEY)
-    
-    if json_str:
-        try:
+def get_cached_status(worksheet):
+    """Reads the last known status from the Cache sheet (Cell A2)."""
+    try:
+        # Get the JSON string from the cache sheet (always cell A2)
+        json_str = worksheet.acell('A2').value
+        if json_str:
             return json.loads(json_str)
-        except Exception as e:
-            logging.error(f"Error loading cache JSON: {e}")
-            pass # Use default cache if loading fails
-            
-    # Initialize cache if the variable is empty or broken
+    except Exception as e:
+        logging.error(f"Error loading cache from Sheet: {e}")
+        
+    # Initialize cache if the value is empty or broken
     default_state = {"playing": False, "game_name": "N/A", "start_time": None}
     return {uid: default_state for uid in FRIENDS_TO_TRACK}
 
-def save_cached_status(status_data):
-    """Prints the new status JSON string to the console for Render to capture."""
-    # We don't save the variable here; Render captures the output in Step 2.
-    # The output MUST be exactly 'RENDER_SET_ENV_START{"key":"ROBLOX_CACHE", "value":"..."}RENDER_SET_ENV_END'
-    
-    # We must reset the variable in the environment for the next run.
-    json_str = json.dumps(status_data)
-    
-    # This specific print statement tells Render to update the environment variable
-    # We will set up the corresponding Render setting in the next step
-    print(f'RENDER_SET_ENV_START{{"key":"{CACHE_ENV_KEY}", "value":{json.dumps(json_str)}}}RENDER_SET_ENV_END')
+def save_cached_status(worksheet, status_data):
+    """Writes the current status to the Cache sheet (Cell A2)."""
+    try:
+        json_str = json.dumps(status_data)
+        # Update the cache cell (A2) with the new JSON string
+        worksheet.update('A2', json_str)
+    except Exception as e:
+        logging.error(f"Error saving cache to Sheet: {e}")
 
 def check_roblox_status(user_ids):
     """Fetches current status from the Roblox API."""
@@ -78,6 +74,7 @@ def check_roblox_status(user_ids):
         current_status = {}
         for item in presence:
             uid = item['userId']
+            # userPresenceType 1 or 2 means they are online/playing
             is_playing = item['userPresenceType'] in [1, 2] 
             game_name = item.get('lastLocation') if is_playing else "N/A"
             
@@ -91,28 +88,26 @@ def check_roblox_status(user_ids):
         return None
 
 # ---------------------------------------------
-# 3. THE MAIN TRACKING LOGIC (NO LOGIC CHANGE)
+# 3. THE MAIN TRACKING LOGIC
 # ---------------------------------------------
 def run_tracking_logic():
-    # ... [The rest of the run_tracking_logic function is the same] ...
-    # (The logic for connecting to sheets, checking status, logging starts/stops, 
-    # and calculating duration remains IDENTICAL to the previous version.)
-    # We only changed the get_cached_status and save_cached_status helper functions.
-    
-    # Note: For brevity here, assume you paste the full logic from the prior working version
-    # (The one with duration calculation) here, keeping only the updated helper functions above.
-    
     # --- Connect to Google Sheets ---
     try:
+        # Connect to Google Sheets service using credentials.json
         gc = gspread.service_account(filename="credentials.json") 
         spreadsheet = gc.open(GOOGLE_SHEET_NAME)
-        worksheet = spreadsheet.sheet1 
+        
+        # *** THE FIX: Explicitly open the worksheets by name ***
+        data_worksheet = spreadsheet.worksheet(DATA_SHEET_NAME) 
+        cache_worksheet = spreadsheet.worksheet(CACHE_SHEET_NAME)
+        # ---------------------------------------------------
+        
     except Exception as e:
         logging.error(f"Google Sheets connection failed: {e}")
         return f"ERROR: Google Sheets connection failed. Details: {e}"
 
-    # --- Get cached and current status ---
-    cached_status = get_cached_status()
+    # Get cached and current status
+    cached_status = get_cached_status(cache_worksheet)
     current_roblox_status = check_roblox_status(FRIENDS_TO_TRACK.keys())
     
     if not current_roblox_status:
@@ -190,9 +185,9 @@ def run_tracking_logic():
 
     # --- D. WRITE LOGS AND SAVE CACHE ---
     if logs_to_write:
-        worksheet.append_rows(logs_to_write)
+        data_worksheet.append_rows(logs_to_write)
     
-    save_cached_status(new_cache)
+    save_cached_status(cache_worksheet, new_cache)
 
     return f"SUCCESS: Checked {len(FRIENDS_TO_TRACK)} friends. {len(logs_to_write)} new events logged."
     
