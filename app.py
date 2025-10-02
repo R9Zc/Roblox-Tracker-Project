@@ -28,9 +28,6 @@ FRIENDS_TO_TRACK = {
     5120230728: "jsadujgha", 
     4491738101: "NOTKRZEN", 
     3263707365: "Cyrus_STORM",
-    # --- START OF NEW FRIEND ---
-    1992158202: "hulk_buster9402", # <-- Replace the ID and Name here!
-    # --- END OF NEW FRIEND ---
 }
 # ==========================================================
 
@@ -52,8 +49,8 @@ def get_cached_status(worksheet):
     except Exception as e:
         logging.error(f"Error loading cache from Sheet: {e}")
         
-    # start_time_utc is set to None if status is offline
-    default_state = {"playing": False, "game_name": "N/A", "start_time_utc": None}
+    # Default state for new or empty cache
+    default_state = {"playing": False, "game_name": "Offline", "start_time_utc": None, "place_id": 0}
     return {uid: default_state for uid in FRIENDS_TO_TRACK}
 
 def save_cached_status(worksheet, status_data):
@@ -77,25 +74,31 @@ def check_roblox_status(user_ids):
         for item in presence:
             uid = item['userId']
             
-            # userPresenceType: 0=Offline, 1=In Game, 2=In Studio, 3=Online/Website
-            # V6 FIX: ONLY track In Game (1) and In Studio (2). Ignore Website/Online (3).
+            # V9 FIX: ONLY track In Game (1) and In Studio (2) as "playing" to control logs.
             is_playing = item['userPresenceType'] in [1, 2] 
+            user_presence_type = item['userPresenceType'] 
             
-            # --- Game Name Handling ---
+            # --- Game Data Handling (Prioritize Place ID) ---
             game_name = item.get('lastLocation')
-            place_id = item.get('placeId')
+            place_id = item.get('placeId', 0) # Get placeId, default to 0
             
-            if not is_playing:
-                game_name = "Offline" # Force this if they are not in game/studio (0 or 3)
-            elif not game_name or game_name.strip() == "":
+            if user_presence_type == 0:
+                # Truly offline
+                game_name = "Offline" 
+            elif user_presence_type == 3:
+                # On the website. Use "Website" or existing name.
+                game_name = "Website" if not game_name or game_name.strip() in ("", "N/A") else game_name
+            elif is_playing:
+                # If playing a real game (Type 1 or 2)
                 if place_id and place_id != 0:
-                    game_name = f"Game ID: {place_id}"
-                else:
-                    game_name = "N/A" # Playing, but no game info (rare)
+                    game_name = f"Game ID: {place_id}" # Log Game ID as the Name
+                elif not game_name or game_name.strip() == "":
+                    game_name = "N/A - Playing" # Fallback if ID is zero and name is empty
 
             current_status[uid] = {
                 "playing": is_playing, 
-                "game_name": game_name
+                "game_name": game_name,
+                "place_id": place_id # Store the place ID separately
             }
         return current_status
     except Exception as e:
@@ -124,7 +127,6 @@ def execute_tracking():
         return f"ERROR: Google Sheets connection failed. Details: {e}"
 
     # Get cached and current status
-    # NOTE: get_cached_status is smart enough to handle new friends not in the cache
     cached_status = get_cached_status(cache_worksheet)
     current_roblox_status = check_roblox_status(FRIENDS_TO_TRACK.keys())
     
@@ -134,7 +136,7 @@ def execute_tracking():
     new_cache = {}
     logs_to_write = []
     
-    # --- TIME HANDLING FIX: Use UTC for internal caching and IST for logging ---
+    # --- TIME HANDLING: Use UTC for internal caching and IST for logging ---
     try:
         ist_tz = pytz.timezone('Asia/Kolkata')
         current_time_utc = datetime.datetime.now(pytz.utc)
@@ -150,63 +152,77 @@ def execute_tracking():
 
     # --- COMPARE AND LOG CHANGES ---
     for uid, friend_name in FRIENDS_TO_TRACK.items():
-        # Using a new key for start time in the cache logic
-        current = current_roblox_status.get(uid, {"playing": False, "game_name": "Offline"})
-        cached = cached_status.get(uid, {"playing": False, "game_name": "Offline", "start_time_utc": None})
+        # Fallback for missing place_id in old cache
+        cached_default = {"playing": False, "game_name": "Offline", "start_time_utc": None, "place_id": 0}
+        cached = cached_status.get(uid, cached_default)
+        
+        current = current_roblox_status.get(uid, {"playing": False, "game_name": "Offline", "place_id": 0})
         
         current_game_name = current['game_name']
         cached_game_name = cached['game_name']
+        
+        # Start with the current cached state for the next cache update
+        new_cache[uid] = cached.copy()
 
-        # Prepare data for the new cache
-        new_cache[uid] = {
-            "playing": current['playing'], 
-            "game_name": current_game_name, 
-            "start_time_utc": cached['start_time_utc'] # Preserve old UTC start time
-        }
-
-        # 1. STARTED PLAYING (OFFLINE -> IN GAME/STUDIO)
+        # 1. STARTED PLAYING (OFFLINE/WEBSITE -> IN REAL GAME/STUDIO)
+        # Check if they were NOT playing and are now playing
         if not cached['playing'] and current['playing']:
             action = "STARTED PLAYING"
             game = current_game_name
             logs_to_write.append([timestamp_log_str, friend_name, action, game, ""]) 
-            # Set the new start time in UTC
+            
+            # UPDATE NEW CACHE STATE
+            new_cache[uid]["playing"] = True
+            new_cache[uid]["game_name"] = current_game_name
+            new_cache[uid]["place_id"] = current['place_id']
             new_cache[uid]["start_time_utc"] = timestamp_cache_str
 
-        # 2. STOPPED PLAYING (IN GAME/STUDIO -> OFFLINE/WEBSITE)
-        elif cached['playing'] and not current['playing']:
+        # 2. STOPPED PLAYING (IN REAL GAME/STUDIO -> OFFLINE/WEBSITE)
+        # Check if they were playing AND are now NOT playing
+        # V9 FIX: Check if the cached place_id was > 0 to ensure it was a real game being tracked
+        elif cached['playing'] and cached['place_id'] > 0 and not current['playing']:
             action = "STOPPED PLAYING"
-            game = cached_game_name 
+            game = cached_game_name # Use cached game name (Game ID: XXX) for the log
             duration_minutes = ""
             
             if cached['start_time_utc']:
                 try:
-                    # Parse UTC string from cache
                     start_time_utc_dt = datetime.datetime.strptime(cached['start_time_utc'], "%Y-%m-%d %H:%M:%S+00:00")
                     start_time_utc_aware = pytz.utc.localize(start_time_utc_dt)
                     
-                    # Ensure current_time_utc is timezone-aware for subtraction
                     duration = current_time_utc.replace(tzinfo=pytz.utc) - start_time_utc_aware
                     duration_minutes = round(duration.total_seconds() / 60, 2)
                 except Exception as e:
                     logging.error(f"Error calculating duration for {friend_name}: {e}")
             
             logs_to_write.append([timestamp_log_str, friend_name, action, game, duration_minutes])
-            # Clear start time when they stop
+            
+            # UPDATE NEW CACHE STATE
+            new_cache[uid]["playing"] = False
+            new_cache[uid]["game_name"] = current_game_name # Set name to 'Offline' or 'Website'
+            new_cache[uid]["place_id"] = current['place_id'] # Store the new place_id (likely 0)
             new_cache[uid]["start_time_utc"] = None
 
-        # 3. Game Changed (While still playing): Update game name, but preserve UTC start time.
-        elif current['playing'] and cached['playing'] and current_game_name != cached_game_name:
-            # We don't log this, but we update the cached game name for the eventual STOP log
+        # 3. GAME CHANGED (While still playing A game)
+        # Check if they are still playing AND the place ID changed (more reliable than name)
+        elif cached['playing'] and current['playing'] and current['place_id'] != cached['place_id'] and current['place_id'] != 0:
+            # We don't log a stop/start, but we update the cached game name and place ID
             new_cache[uid]["game_name"] = current_game_name
+            new_cache[uid]["place_id"] = current['place_id']
             
-        # 4. Still Playing Same Game: Preserve original UTC start_time. No logging.
+        # 4. Website/Offline flip: No change to logging, but update the cache name/ID (place_id will be 0)
+        elif not cached['playing'] and not current['playing'] and (current_game_name != cached_game_name or current['place_id'] != cached['place_id']):
+            # This handles the flip between "Offline" and "Website" without logging.
+            new_cache[uid]["game_name"] = current_game_name
+            new_cache[uid]["place_id"] = current['place_id']
+        
+        # 5. Otherwise, no meaningful change. Cached state is preserved.
 
 
     # --- WRITE LOGS AND SAVE CACHE ---
     if logs_to_write:
         data_worksheet.append_rows(logs_to_write)
     
-    # NOTE: This ensures the new friend is added to the cache with default "Offline" status
     save_cached_status(cache_worksheet, new_cache)
 
     return f"SUCCESS: Checked {len(FRIENDS_TO_TRACK)} friends. {len(logs_to_write)} new events logged."
