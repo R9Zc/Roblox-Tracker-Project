@@ -49,7 +49,7 @@ def get_cached_status(worksheet):
     except Exception as e:
         logging.error(f"Error loading cache from Sheet: {e}")
         
-    default_state = {"playing": False, "game_name": "N/A", "start_time": None}
+    default_state = {"playing": False, "game_name": "N/A", "start_time_utc": None}
     return {uid: default_state for uid in FRIENDS_TO_TRACK}
 
 def save_cached_status(worksheet, status_data):
@@ -74,16 +74,18 @@ def check_roblox_status(user_ids):
             uid = item['userId']
             
             # userPresenceType: 0=Offline, 1=In Game, 2=In Studio, 3=Online/Website
-            # CRITICAL FIX: is_playing is TRUE for ALL online statuses (1, 2, or 3)
             is_playing = item['userPresenceType'] in [1, 2, 3] 
             
-            # Capture the lastLocation if it exists. If they are 'Online/Website' (type 3), 
-            # lastLocation is usually blank, so we default to 'N/A' or a more descriptive term.
+            # --- Game Name Fix (V3) ---
             game_name = item.get('lastLocation')
-            if not game_name or game_name.strip() == "":
-                # If they are online but not in a game/studio, show "N/A"
-                game_name = "N/A"
+            place_id = item.get('placeId')
             
+            if not game_name or game_name.strip() == "":
+                if place_id and place_id != 0:
+                    game_name = f"Game ID: {place_id}"
+                else:
+                    game_name = "N/A"
+
             current_status[uid] = {
                 "playing": is_playing, 
                 "game_name": game_name
@@ -124,21 +126,19 @@ def execute_tracking():
     new_cache = {}
     logs_to_write = []
     
-    # --- TIMEZONE FIX: Convert time to IST ---
-    try:
-        ist = pytz.timezone('Asia/Kolkata')
-        current_time_dt = datetime.datetime.now(ist)
-        timestamp_str = current_time_dt.strftime("%Y-%m-%d %H:%M:%S")
-    except NameError:
-        current_time_dt = datetime.datetime.now()
-        timestamp_str = current_time_dt.strftime("%Y-%m-%d %H:%M:%S (UTC/Server Time)")
-        logging.error("Pytz not found. Check requirements.txt.")
+    # --- TIME HANDLING FIX: Use UTC for internal caching and IST for logging ---
+    ist_tz = pytz.timezone('Asia/Kolkata')
+    current_time_utc = datetime.datetime.now(pytz.utc)
+    current_time_ist = current_time_utc.astimezone(ist_tz)
+    timestamp_log_str = current_time_ist.strftime("%Y-%m-%d %H:%M:%S")
+    timestamp_cache_str = current_time_utc.strftime("%Y-%m-%d %H:%M:%S+00:00") # UTC format for cache
         
 
     # --- COMPARE AND LOG CHANGES ---
     for uid, friend_name in FRIENDS_TO_TRACK.items():
+        # Using a new key for start time in the cache logic
         current = current_roblox_status.get(uid, {"playing": False, "game_name": "N/A"})
-        cached = cached_status.get(uid, {"playing": False, "game_name": "N/A", "start_time": None})
+        cached = cached_status.get(uid, {"playing": False, "game_name": "N/A", "start_time_utc": None})
         
         current_game_name = current['game_name']
         cached_game_name = cached['game_name']
@@ -147,16 +147,16 @@ def execute_tracking():
         new_cache[uid] = {
             "playing": current['playing'], 
             "game_name": current_game_name, 
-            "start_time": cached['start_time'] # Preserve old start time unless status changes
+            "start_time_utc": cached['start_time_utc'] # Preserve old UTC start time
         }
 
         # 1. STARTED PLAYING (OFFLINE -> ONLINE)
         if not cached['playing'] and current['playing']:
             action = "STARTED PLAYING"
             game = current_game_name
-            logs_to_write.append([timestamp_str, friend_name, action, game, ""]) 
-            # Set the new start time when they start
-            new_cache[uid]["start_time"] = timestamp_str
+            logs_to_write.append([timestamp_log_str, friend_name, action, game, ""]) 
+            # Set the new start time in UTC
+            new_cache[uid]["start_time_utc"] = timestamp_cache_str
 
         # 2. STOPPED PLAYING (ONLINE -> OFFLINE)
         elif cached['playing'] and not current['playing']:
@@ -164,27 +164,27 @@ def execute_tracking():
             game = cached_game_name 
             duration_minutes = ""
             
-            if cached['start_time']:
+            if cached['start_time_utc']:
                 try:
-                    start_time_dt = datetime.datetime.strptime(cached['start_time'], "%Y-%m-%d %H:%M:%S")
-                    ist_tz = pytz.timezone('Asia/Kolkata')
-                    start_time_dt_aware = ist_tz.localize(start_time_dt)
+                    # Parse UTC string from cache
+                    start_time_utc_dt = datetime.datetime.strptime(cached['start_time_utc'], "%Y-%m-%d %H:%M:%S+00:00")
+                    start_time_utc_aware = pytz.utc.localize(start_time_utc_dt)
                     
-                    duration = current_time_dt - start_time_dt_aware
+                    duration = current_time_utc - start_time_utc_aware
                     duration_minutes = round(duration.total_seconds() / 60, 2)
                 except Exception as e:
                     logging.error(f"Error calculating duration for {friend_name}: {e}")
             
-            logs_to_write.append([timestamp_str, friend_name, action, game, duration_minutes])
+            logs_to_write.append([timestamp_log_str, friend_name, action, game, duration_minutes])
             # Clear start time when they stop
-            new_cache[uid]["start_time"] = None
+            new_cache[uid]["start_time_utc"] = None
             
-        # 3. Game Changed (While still playing): Update game name, but preserve start time.
+        # 3. Game Changed (While still playing): Update game name, but preserve UTC start time.
         elif current['playing'] and cached['playing'] and current_game_name != cached_game_name:
             # We don't log this, but we update the cached game name for the eventual STOP log
             new_cache[uid]["game_name"] = current_game_name
             
-        # 4. Still Playing Same Game: Preserve original start_time. No logging.
+        # 4. Still Playing Same Game: Preserve original UTC start_time. No logging.
 
 
     # --- WRITE LOGS AND SAVE CACHE ---
