@@ -49,6 +49,7 @@ def get_cached_status(worksheet):
     except Exception as e:
         logging.error(f"Error loading cache from Sheet: {e}")
         
+    # start_time_utc is set to None if status is offline
     default_state = {"playing": False, "game_name": "N/A", "start_time_utc": None}
     return {uid: default_state for uid in FRIENDS_TO_TRACK}
 
@@ -74,17 +75,20 @@ def check_roblox_status(user_ids):
             uid = item['userId']
             
             # userPresenceType: 0=Offline, 1=In Game, 2=In Studio, 3=Online/Website
-            is_playing = item['userPresenceType'] in [1, 2, 3] 
+            # V6 FIX: ONLY track In Game (1) and In Studio (2). Ignore Website/Online (3).
+            is_playing = item['userPresenceType'] in [1, 2] 
             
-            # --- Game Name Fix (V3) ---
+            # --- Game Name Handling ---
             game_name = item.get('lastLocation')
             place_id = item.get('placeId')
             
-            if not game_name or game_name.strip() == "":
+            if not is_playing:
+                game_name = "Offline" # Force this if they are not in game/studio (0 or 3)
+            elif not game_name or game_name.strip() == "":
                 if place_id and place_id != 0:
                     game_name = f"Game ID: {place_id}"
                 else:
-                    game_name = "N/A"
+                    game_name = "N/A" # Playing, but no game info (rare)
 
             current_status[uid] = {
                 "playing": is_playing, 
@@ -127,30 +131,36 @@ def execute_tracking():
     logs_to_write = []
     
     # --- TIME HANDLING FIX: Use UTC for internal caching and IST for logging ---
-    ist_tz = pytz.timezone('Asia/Kolkata')
-    current_time_utc = datetime.datetime.now(pytz.utc)
-    current_time_ist = current_time_utc.astimezone(ist_tz)
-    timestamp_log_str = current_time_ist.strftime("%Y-%m-%d %H:%M:%S")
-    timestamp_cache_str = current_time_utc.strftime("%Y-%m-%d %H:%M:%S+00:00") # UTC format for cache
+    try:
+        ist_tz = pytz.timezone('Asia/Kolkata')
+        current_time_utc = datetime.datetime.now(pytz.utc)
+        current_time_ist = current_time_utc.astimezone(ist_tz)
+        timestamp_log_str = current_time_ist.strftime("%Y-%m-%d %H:%M:%S")
+        timestamp_cache_str = current_time_utc.strftime("%Y-%m-%d %H:%M:%S+00:00") # UTC format for cache
+    except Exception:
+        # Fallback if pytz is missing
+        current_time_utc = datetime.datetime.now(datetime.timezone.utc)
+        timestamp_log_str = current_time_utc.strftime("%Y-%m-%d %H:%M:%S (UTC)")
+        timestamp_cache_str = current_time_utc.strftime("%Y-%m-%d %H:%M:%S+00:00")
         
 
     # --- COMPARE AND LOG CHANGES ---
     for uid, friend_name in FRIENDS_TO_TRACK.items():
         # Using a new key for start time in the cache logic
-        current = current_roblox_status.get(uid, {"playing": False, "game_name": "N/A"})
-        cached = cached_status.get(uid, {"playing": False, "game_name": "N/A", "start_time_utc": None})
+        current = current_roblox_status.get(uid, {"playing": False, "game_name": "Offline"})
+        cached = cached_status.get(uid, {"playing": False, "game_name": "Offline", "start_time_utc": None})
         
         current_game_name = current['game_name']
         cached_game_name = cached['game_name']
 
-        # Prepare data for the new cache (IMPORTANT: Copy the current status)
+        # Prepare data for the new cache
         new_cache[uid] = {
             "playing": current['playing'], 
             "game_name": current_game_name, 
             "start_time_utc": cached['start_time_utc'] # Preserve old UTC start time
         }
 
-        # 1. STARTED PLAYING (OFFLINE -> ONLINE)
+        # 1. STARTED PLAYING (OFFLINE -> IN GAME/STUDIO)
         if not cached['playing'] and current['playing']:
             action = "STARTED PLAYING"
             game = current_game_name
@@ -158,7 +168,7 @@ def execute_tracking():
             # Set the new start time in UTC
             new_cache[uid]["start_time_utc"] = timestamp_cache_str
 
-        # 2. STOPPED PLAYING (ONLINE -> OFFLINE)
+        # 2. STOPPED PLAYING (IN GAME/STUDIO -> OFFLINE/WEBSITE)
         elif cached['playing'] and not current['playing']:
             action = "STOPPED PLAYING"
             game = cached_game_name 
@@ -170,7 +180,8 @@ def execute_tracking():
                     start_time_utc_dt = datetime.datetime.strptime(cached['start_time_utc'], "%Y-%m-%d %H:%M:%S+00:00")
                     start_time_utc_aware = pytz.utc.localize(start_time_utc_dt)
                     
-                    duration = current_time_utc - start_time_utc_aware
+                    # Ensure current_time_utc is timezone-aware for subtraction
+                    duration = current_time_utc.replace(tzinfo=pytz.utc) - start_time_utc_aware
                     duration_minutes = round(duration.total_seconds() / 60, 2)
                 except Exception as e:
                     logging.error(f"Error calculating duration for {friend_name}: {e}")
@@ -178,7 +189,7 @@ def execute_tracking():
             logs_to_write.append([timestamp_log_str, friend_name, action, game, duration_minutes])
             # Clear start time when they stop
             new_cache[uid]["start_time_utc"] = None
-            
+
         # 3. Game Changed (While still playing): Update game name, but preserve UTC start time.
         elif current['playing'] and cached['playing'] and current_game_name != cached_game_name:
             # We don't log this, but we update the cached game name for the eventual STOP log
@@ -199,9 +210,8 @@ def execute_tracking():
 # 4. WEB ROUTES
 # ---------------------------------------------
 
-# Primary tracking route (used by Cron-Job)
+# Main tracker route (runs on both / and /track)
 @app.route('/track')
-# Health check route (used by Render's internal monitor)
 @app.route('/') 
 def main_tracker_route():
     result = execute_tracking()
