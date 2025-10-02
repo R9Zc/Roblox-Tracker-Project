@@ -95,8 +95,8 @@ def run_tracking_logic():
     try:
         # Connect to Google Sheets service using credentials.json
         creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+creds_json = os.environ.get('GOOGLE_CREDENTIALS')
 gc = gspread.service_account_from_dict(json.loads(creds_json))
-        spreadsheet = gc.open(GOOGLE_SHEET_NAME)
         
         # *** THE FIX: Explicitly open the worksheets by name ***
         data_worksheet = spreadsheet.worksheet(DATA_SHEET_NAME) 
@@ -203,4 +203,5 @@ def index():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
