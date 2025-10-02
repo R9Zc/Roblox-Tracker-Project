@@ -23,7 +23,7 @@ GOOGLE_SHEET_NAME = "Minute Tracker Data"
 
 # ==========================================================
 # *** 2. CRITICAL: LIST YOUR FRIENDS' USER IDs AND NAMES ***
-# *** V13 FIX: CORRECTED ID FOR HULK_BUSTER9402 (1992158202) ***
+# *** V14: FINAL CORRECTED ID FOR HULK_BUSTER9402 (1992158202) ***
 # ==========================================================
 FRIENDS_TO_TRACK = {
     5120230728: "jsadujgha", 
@@ -74,10 +74,15 @@ def check_roblox_status(user_ids):
         
         presence = response.json().get('userPresences', [])
         current_status = {}
+        
+        # --- NEW: DEBUG LOGGING TO RENDER CONSOLE ---
+        debug_log = "API Status received:"
+        # -------------------------------------------
+        
         for item in presence:
             uid = item['userId']
             
-            # V13: ALL status types except Offline (0) are considered 'playing'. 
+            # V14: ALL status types except Offline (0) are considered 'playing'. 
             is_playing = item['userPresenceType'] in [1, 2, 3] 
             user_presence_type = item['userPresenceType'] 
             
@@ -87,21 +92,29 @@ def check_roblox_status(user_ids):
             
             if user_presence_type == 0:
                 # Truly offline
-                game_name = "Offline" 
+                display_game_name = "Offline"
             elif is_playing:
                 # If online (Type 1, 2, or 3)
                 if place_id and place_id != 0:
                     # They are in a real place/game
-                    game_name = f"Game ID: {place_id}" 
+                    display_game_name = f"Game ID: {place_id}" 
                 else:
                     # They are on the website or just online
-                    game_name = "Website/Online"
+                    display_game_name = "Website/Online"
+            else:
+                display_game_name = "Unknown" # Fallback
 
             current_status[uid] = {
                 "playing": is_playing, 
-                "game_name": game_name,
+                "game_name": display_game_name, # Use display name for the cache/log
                 "place_id": place_id # Store the place ID separately
             }
+            
+            # --- NEW: DEBUG LOGGING TO RENDER CONSOLE ---
+            debug_log += f" | {FRIENDS_TO_TRACK.get(uid, uid)} (ID: {uid}): Playing={is_playing}, PlaceID={place_id}"
+            # -------------------------------------------
+            
+        logging.info(debug_log)
         return current_status
     except Exception as e:
         logging.error(f"Roblox API check failed: {e}")
@@ -164,6 +177,7 @@ def execute_tracking():
         new_cache[uid] = cached.copy()
         
         # Determine if the user is in a state with a game ID
+        # THIS IS THE STRICT RULE TO PREVENT SPAM WHEN PLACE_ID IS 0
         cached_in_game_id = cached['playing'] and cached['place_id'] != 0
         current_in_game_id = current['playing'] and current['place_id'] != 0
 
