@@ -56,7 +56,6 @@ def save_cached_status(worksheet, status_data):
     """Writes the current status to the Cache sheet (Cell A2) using the correct list-of-lists format."""
     try:
         json_str = json.dumps(status_data)
-        # CRITICAL: Use list of lists format for single cell update
         worksheet.update('A2', [[json_str]])
     except Exception as e:
         logging.error(f"Error saving cache to Sheet: {e}")
@@ -75,19 +74,16 @@ def check_roblox_status(user_ids):
             uid = item['userId']
             
             # userPresenceType: 0=Offline, 1=In Game, 2=In Studio, 3=Online/Website
-            is_playing = item['userPresenceType'] in [1, 2, 3] # Consider "Online" as a playing state for tracking
+            # CRITICAL FIX: is_playing is TRUE for ALL online statuses (1, 2, or 3)
+            is_playing = item['userPresenceType'] in [1, 2, 3] 
             
-            # --- START OF FIX: Capture lastLocation if user is playing (type 1, 2, or 3) ---
+            # Capture the lastLocation if it exists. If they are 'Online/Website' (type 3), 
+            # lastLocation is usually blank, so we default to 'N/A' or a more descriptive term.
             game_name = item.get('lastLocation')
             if not game_name or game_name.strip() == "":
+                # If they are online but not in a game/studio, show "N/A"
                 game_name = "N/A"
-            # --- END OF FIX ---
             
-            # Refine is_playing: If they are only on the website/online (Type 3) and lastLocation is blank, 
-            # we should treat them as just 'Online', which still counts as 'playing' for tracking.
-            if item['userPresenceType'] == 3 and game_name == "N/A":
-                 game_name = "Website/Online"
-
             current_status[uid] = {
                 "playing": is_playing, 
                 "game_name": game_name
@@ -147,11 +143,11 @@ def execute_tracking():
         current_game_name = current['game_name']
         cached_game_name = cached['game_name']
 
-        # Prepare data for the new cache
+        # Prepare data for the new cache (IMPORTANT: Copy the current status)
         new_cache[uid] = {
             "playing": current['playing'], 
             "game_name": current_game_name, 
-            "start_time": cached['start_time']
+            "start_time": cached['start_time'] # Preserve old start time unless status changes
         }
 
         # 1. STARTED PLAYING (OFFLINE -> ONLINE)
@@ -159,6 +155,7 @@ def execute_tracking():
             action = "STARTED PLAYING"
             game = current_game_name
             logs_to_write.append([timestamp_str, friend_name, action, game, ""]) 
+            # Set the new start time when they start
             new_cache[uid]["start_time"] = timestamp_str
 
         # 2. STOPPED PLAYING (ONLINE -> OFFLINE)
@@ -169,10 +166,8 @@ def execute_tracking():
             
             if cached['start_time']:
                 try:
-                    # Need to handle potential timezone issues when calculating duration
                     start_time_dt = datetime.datetime.strptime(cached['start_time'], "%Y-%m-%d %H:%M:%S")
                     ist_tz = pytz.timezone('Asia/Kolkata')
-                    # Assume start_time was saved as IST, localize it
                     start_time_dt_aware = ist_tz.localize(start_time_dt)
                     
                     duration = current_time_dt - start_time_dt_aware
@@ -181,18 +176,15 @@ def execute_tracking():
                     logging.error(f"Error calculating duration for {friend_name}: {e}")
             
             logs_to_write.append([timestamp_str, friend_name, action, game, duration_minutes])
+            # Clear start time when they stop
             new_cache[uid]["start_time"] = None
             
-        # 3. Game Changed (While still playing): Update cache, but DON'T log a new start/stop.
-        # This keeps the original start time but updates the name for the next STOP.
+        # 3. Game Changed (While still playing): Update game name, but preserve start time.
         elif current['playing'] and cached['playing'] and current_game_name != cached_game_name:
-            # Preserve original start time, update game name in cache
-            new_cache[uid]["start_time"] = cached['start_time']
+            # We don't log this, but we update the cached game name for the eventual STOP log
             new_cache[uid]["game_name"] = current_game_name
             
-        # 4. Still Playing Same Game: Preserve original start_time and game_name.
-        elif current['playing']:
-            new_cache[uid]["start_time"] = cached['start_time']
+        # 4. Still Playing Same Game: Preserve original start_time. No logging.
 
 
     # --- WRITE LOGS AND SAVE CACHE ---
