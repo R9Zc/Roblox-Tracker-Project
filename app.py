@@ -201,14 +201,11 @@ def execute_tracking():
 
 # Primary tracking route (used by Cron-Job)
 @app.route('/track')
-def track():
+# Health check route (used by Render's internal monitor)
+@app.route('/') 
+def main_tracker_route():
     result = execute_tracking()
     return result
-
-# Health check route (used by Render's internal monitor)
-@app.route('/')
-def health_check():
-    return "OK"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
