@@ -73,9 +73,21 @@ def check_roblox_status(user_ids):
         current_status = {}
         for item in presence:
             uid = item['userId']
-            is_playing = item['userPresenceType'] in [1, 2] 
-            game_name = item.get('lastLocation') if is_playing and item.get('lastLocation') else "N/A"
             
+            # userPresenceType: 0=Offline, 1=In Game, 2=In Studio, 3=Online/Website
+            is_playing = item['userPresenceType'] in [1, 2, 3] # Consider "Online" as a playing state for tracking
+            
+            # --- START OF FIX: Capture lastLocation if user is playing (type 1, 2, or 3) ---
+            game_name = item.get('lastLocation')
+            if not game_name or game_name.strip() == "":
+                game_name = "N/A"
+            # --- END OF FIX ---
+            
+            # Refine is_playing: If they are only on the website/online (Type 3) and lastLocation is blank, 
+            # we should treat them as just 'Online', which still counts as 'playing' for tracking.
+            if item['userPresenceType'] == 3 and game_name == "N/A":
+                 game_name = "Website/Online"
+
             current_status[uid] = {
                 "playing": is_playing, 
                 "game_name": game_name
@@ -157,8 +169,10 @@ def execute_tracking():
             
             if cached['start_time']:
                 try:
+                    # Need to handle potential timezone issues when calculating duration
                     start_time_dt = datetime.datetime.strptime(cached['start_time'], "%Y-%m-%d %H:%M:%S")
                     ist_tz = pytz.timezone('Asia/Kolkata')
+                    # Assume start_time was saved as IST, localize it
                     start_time_dt_aware = ist_tz.localize(start_time_dt)
                     
                     duration = current_time_dt - start_time_dt_aware
@@ -169,11 +183,14 @@ def execute_tracking():
             logs_to_write.append([timestamp_str, friend_name, action, game, duration_minutes])
             new_cache[uid]["start_time"] = None
             
-        # 3. Game Changed (While still playing): Update cache, but DON'T log.
+        # 3. Game Changed (While still playing): Update cache, but DON'T log a new start/stop.
+        # This keeps the original start time but updates the name for the next STOP.
         elif current['playing'] and cached['playing'] and current_game_name != cached_game_name:
-            new_cache[uid]["start_time"] = timestamp_str
+            # Preserve original start time, update game name in cache
+            new_cache[uid]["start_time"] = cached['start_time']
+            new_cache[uid]["game_name"] = current_game_name
             
-        # 4. Still Playing Same Game: Preserve original start_time.
+        # 4. Still Playing Same Game: Preserve original start_time and game_name.
         elif current['playing']:
             new_cache[uid]["start_time"] = cached['start_time']
 
