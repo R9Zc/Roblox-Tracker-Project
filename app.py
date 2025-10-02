@@ -23,13 +23,11 @@ GOOGLE_SHEET_NAME = "Minute Tracker Data"
 
 # ==========================================================
 # *** 2. CRITICAL: LIST YOUR FRIENDS' USER IDs AND NAMES ***
-# *** V14: FINAL CORRECTED ID FOR HULK_BUSTER9402 (1992158202) ***
 # ==========================================================
 FRIENDS_TO_TRACK = {
     5120230728: "jsadujgha", 
     4491738101: "NOTKRZEN", 
     3263707365: "Cyrus_STORM",
-    # FINAL CORRECTED ID for your user
     1992158202: "hulk_buster9402", 
 }
 # ==========================================================
@@ -82,24 +80,32 @@ def check_roblox_status(user_ids):
         for item in presence:
             uid = item['userId']
             
-            # V14: ALL status types except Offline (0) are considered 'playing'. 
+            # V15: ALL status types except Offline (0) are considered 'playing'. 
             is_playing = item['userPresenceType'] in [1, 2, 3] 
             user_presence_type = item['userPresenceType'] 
             
-            # --- Game Data Handling (Prioritize Place ID) ---
-            game_name = item.get('lastLocation')
-            place_id = item.get('placeId', 0) # Get placeId, default to 0
+            # --- Game Data Handling ---
+            # V15 FIX: Explicitly check for None
+            place_id = item.get('placeId') # Get placeId, which might be None, 0, or a large number.
             
+            # Use 0 if it's None or the value is missing, otherwise use the received number.
+            # We explicitly check for None later in the logic.
+            place_id_for_cache = place_id if place_id is not None else 0 
+            
+            # Determine if they are in a real game (Must be Playing AND Place ID must be > 0)
+            is_in_real_game = is_playing and place_id_for_cache != 0
+
             if user_presence_type == 0:
                 # Truly offline
                 display_game_name = "Offline"
             elif is_playing:
                 # If online (Type 1, 2, or 3)
-                if place_id and place_id != 0:
+                if is_in_real_game:
                     # They are in a real place/game
-                    display_game_name = f"Game ID: {place_id}" 
+                    display_game_name = f"Game ID: {place_id_for_cache}" 
                 else:
                     # They are on the website or just online
+                    # NOTE: This covers the "Playing=True, PlaceID=None" scenario for logging
                     display_game_name = "Website/Online"
             else:
                 display_game_name = "Unknown" # Fallback
@@ -107,10 +113,10 @@ def check_roblox_status(user_ids):
             current_status[uid] = {
                 "playing": is_playing, 
                 "game_name": display_game_name, # Use display name for the cache/log
-                "place_id": place_id # Store the place ID separately
+                "place_id": place_id_for_cache # Store 0 or the actual ID
             }
             
-            # --- NEW: DEBUG LOGGING TO RENDER CONSOLE ---
+            # --- NEW: DEBUG LOGGING TO RENDER CONSOLE (Shows actual API response values) ---
             debug_log += f" | {FRIENDS_TO_TRACK.get(uid, uid)} (ID: {uid}): Playing={is_playing}, PlaceID={place_id}"
             # -------------------------------------------
             
@@ -177,7 +183,7 @@ def execute_tracking():
         new_cache[uid] = cached.copy()
         
         # Determine if the user is in a state with a game ID
-        # THIS IS THE STRICT RULE TO PREVENT SPAM WHEN PLACE_ID IS 0
+        # LOGIC IS BASED ON place_id != 0, which is the reliable marker for a real game.
         cached_in_game_id = cached['playing'] and cached['place_id'] != 0
         current_in_game_id = current['playing'] and current['place_id'] != 0
 
