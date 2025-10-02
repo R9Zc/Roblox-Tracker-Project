@@ -56,6 +56,7 @@ def save_cached_status(worksheet, status_data):
     """Writes the current status to the Cache sheet (Cell A2) using the correct list-of-lists format."""
     try:
         json_str = json.dumps(status_data)
+        # CRITICAL: Use list of lists format for single cell update
         worksheet.update('A2', [[json_str]])
     except Exception as e:
         logging.error(f"Error saving cache to Sheet: {e}")
@@ -134,7 +135,7 @@ def execute_tracking():
         current_game_name = current['game_name']
         cached_game_name = cached['game_name']
 
-        # --- Prepare data for the new cache ---
+        # Prepare data for the new cache
         new_cache[uid] = {
             "playing": current['playing'], 
             "game_name": current_game_name, 
@@ -168,18 +169,16 @@ def execute_tracking():
             logs_to_write.append([timestamp_str, friend_name, action, game, duration_minutes])
             new_cache[uid]["start_time"] = None
             
-        # 3. If currently playing and the game changed: 
-        #    We update the cache but DO NOT log the event.
+        # 3. Game Changed (While still playing): Update cache, but DON'T log.
         elif current['playing'] and cached['playing'] and current_game_name != cached_game_name:
             new_cache[uid]["start_time"] = timestamp_str
             
-        # 4. If currently playing, no change in status, and game didn't change: 
-        #    We preserve the original start_time.
+        # 4. Still Playing Same Game: Preserve original start_time.
         elif current['playing']:
             new_cache[uid]["start_time"] = cached['start_time']
 
 
-    # --- D. WRITE LOGS AND SAVE CACHE ---
+    # --- WRITE LOGS AND SAVE CACHE ---
     if logs_to_write:
         data_worksheet.append_rows(logs_to_write)
     
@@ -191,13 +190,13 @@ def execute_tracking():
 # 4. WEB ROUTES
 # ---------------------------------------------
 
-# This is the primary route that runs the script (used by your external scheduler)
+# Primary tracking route (used by Cron-Job)
 @app.route('/track')
 def track():
     result = execute_tracking()
     return result
 
-# This is the new, empty route used by Render's health check
+# Health check route (used by Render's internal monitor)
 @app.route('/')
 def health_check():
     return "OK"
@@ -205,6 +204,3 @@ def health_check():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
-```
-
----
