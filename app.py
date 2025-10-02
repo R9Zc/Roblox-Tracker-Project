@@ -5,6 +5,7 @@ import os
 import requests
 import json
 import logging
+import pytz # ADDED: Library for timezone handling
 
 # Set up basic logging (useful for debugging on Render)
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +24,7 @@ GOOGLE_SHEET_NAME = "Minute Tracker Data"
 # ==========================================================
 # *** 2. CRITICAL: LIST YOUR FRIENDS' USER IDs AND NAMES ***
 # Make sure these are the correct Roblox User IDs and not usernames.
+# NOTE: Using the placeholder IDs you provided for safety.
 # ==========================================================
 FRIENDS_TO_TRACK = {
     5120230728: "jsadujgha", 
@@ -45,7 +47,7 @@ def get_cached_status(worksheet):
     try:
         # Get the JSON string from the cache sheet (always cell A2)
         json_str = worksheet.acell('A2').value
-        if json_str:
+        if json_str and json_str.strip() not in ('{}', ''):
             return json.loads(json_str)
     except Exception as e:
         logging.error(f"Error loading cache from Sheet: {e}")
@@ -77,7 +79,10 @@ def check_roblox_status(user_ids):
             uid = item['userId']
             # userPresenceType 1 or 2 means they are online/playing
             is_playing = item['userPresenceType'] in [1, 2] 
-            game_name = item.get('lastLocation') if is_playing else "N/A"
+            
+            # CRITICAL FIX: Get lastLocation which contains the game name
+            # If not playing, or lastLocation is empty, set it to "N/A"
+            game_name = item.get('lastLocation') if is_playing and item.get('lastLocation') else "N/A"
             
             current_status[uid] = {
                 "playing": is_playing, 
@@ -94,12 +99,11 @@ def check_roblox_status(user_ids):
 def run_tracking_logic():
     # --- Connect to Google Sheets ---
     try:
-        # Connect to Google Sheets service using the GOOGLE_CREDENTIALS environment variable
         creds_json = os.environ.get('GOOGLE_CREDENTIALS')
         if not creds_json:
             return "ERROR: GOOGLE_CREDENTIALS environment variable is missing."
         
-        # This line loads the key securely from the environment variable
+        # Load the key securely from the environment variable
         gc = gspread.service_account_from_dict(json.loads(creds_json)) 
         
         spreadsheet = gc.open(GOOGLE_SHEET_NAME)
@@ -110,9 +114,6 @@ def run_tracking_logic():
         
     except Exception as e:
         logging.error(f"Google Sheets connection failed: {e}")
-        # Note: If this fails, the error is likely due to an issue with the 
-        # GOOGLE_CREDENTIALS variable content or not having shared the sheet 
-        # with the service account email.
         return f"ERROR: Google Sheets connection failed. Details: {e}"
 
     # Get cached and current status
@@ -125,7 +126,9 @@ def run_tracking_logic():
     new_cache = {}
     logs_to_write = []
     
-    current_time_dt = datetime.datetime.now()
+    # --- TIMEZONE FIX: Convert UTC time to IST ---
+    ist = pytz.timezone('Asia/Kolkata')
+    current_time_dt = datetime.datetime.now(ist)
     timestamp_str = current_time_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     # --- COMPARE AND LOG CHANGES ---
@@ -133,47 +136,60 @@ def run_tracking_logic():
         current = current_roblox_status.get(uid, {"playing": False, "game_name": "N/A"})
         cached = cached_status.get(uid, {"playing": False, "game_name": "N/A", "start_time": None})
         
+        current_game_name = current['game_name']
+        cached_game_name = cached['game_name']
+
         # Prepare data for the new cache
         new_cache[uid] = {
             "playing": current['playing'], 
-            "game_name": current['game_name'], 
+            "game_name": current_game_name, 
             "start_time": cached['start_time']
         }
 
         # 1. STARTED PLAYING
         if not cached['playing'] and current['playing']:
             action = "STARTED PLAYING"
-            game = current['game_name']
+            game = current_game_name
+            # Log the entry with the game name (D=game, E=duration)
             logs_to_write.append([timestamp_str, friend_name, action, game, ""]) 
             new_cache[uid]["start_time"] = timestamp_str
 
         # 2. STOPPED PLAYING
         elif cached['playing'] and not current['playing']:
             action = "STOPPED PLAYING"
-            game = cached['game_name']
+            game = cached_game_name # Log the game they stopped playing
             duration_minutes = ""
             
             if cached['start_time']:
                 try:
+                    # NOTE: cached start_time is treated as IST for duration calculation
                     start_time_dt = datetime.datetime.strptime(cached['start_time'], "%Y-%m-%d %H:%M:%S")
-                    duration = current_time_dt - start_time_dt
+                    
+                    # Convert start_time_dt to be timezone-aware (as IST) 
+                    # before calculating duration with timezone-aware current_time_dt
+                    start_time_dt_aware = ist.localize(start_time_dt)
+                    
+                    duration = current_time_dt - start_time_dt_aware
                     duration_minutes = round(duration.total_seconds() / 60, 2)
                 except Exception:
                     pass
             
+            # Log the entry with the duration
             logs_to_write.append([timestamp_str, friend_name, action, game, duration_minutes])
             new_cache[uid]["start_time"] = None
             
         # 3. GAME CHANGED
-        elif current['playing'] and cached['playing'] and current['game_name'] != cached['game_name']:
+        elif current['playing'] and cached['playing'] and current_game_name != cached_game_name:
             
             # Log STOP for the old game
-            old_game = cached['game_name']
+            old_game = cached_game_name
             duration_minutes = ""
             if cached['start_time']:
                 try:
                     start_time_dt = datetime.datetime.strptime(cached['start_time'], "%Y-%m-%d %H:%M:%S")
-                    duration = current_time_dt - start_time_dt
+                    start_time_dt_aware = ist.localize(start_time_dt)
+                    
+                    duration = current_time_dt - start_time_dt_aware
                     duration_minutes = round(duration.total_seconds() / 60, 2)
                 except Exception:
                     pass
@@ -181,7 +197,7 @@ def run_tracking_logic():
             logs_to_write.append([timestamp_str, friend_name, "STOPPED PLAYING", old_game, duration_minutes])
             
             # Log START for the new game
-            new_game = current['game_name']
+            new_game = current_game_name
             logs_to_write.append([timestamp_str, friend_name, "STARTED PLAYING", new_game, ""])
             
             # Update cache with new start time
