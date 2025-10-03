@@ -12,24 +12,23 @@ ROBLOX_PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
 ROBLOX_GAME_DETAIL_URL = "https://games.roblox.com/v1/games/multiget-place-details"
 
 # --- Firebase Initialization (Required for Canvas) ---
-db = None # FIX: Initialize db globally to prevent NameError if firebase_admin import fails
+db = None # Initialize db globally to prevent NameError if firebase_admin import fails
 try:
     # IMPORTANT: Ensure firebase_admin is installed: pip install firebase-admin
     from firebase_admin import initialize_app, firestore, credentials
-    # Replace with actual credential loading if running outside an initialized environment
-    # cred = credentials.Certificate("path/to/your/serviceAccountKey.json")
-    # app = initialize_app(cred)
-    # db = firestore.client() # This line would define the global 'db' object
+    # If using Firebase Admin SDK, uncomment the lines below:
+    # app = initialize_app(credentials.Certificate("serviceAccountKey.json"))
+    # db = firestore.client()
     IS_FIREBASE_AVAILABLE = False # Set to True if app initialization is successful
-    # If the try block executes but firebase init is skipped for simulation, db is still None
 except (ImportError, NameError):
     IS_FIREBASE_AVAILABLE = False
     print("Firebase Admin SDK not available. Using in-memory store for simulation.")
 
 # --- API Simulation (In-memory store for simulation) ---
 if not IS_FIREBASE_AVAILABLE:
+    # These global variables are used by the tracker in simulation mode
     user_tracking_cache: Dict[int, Dict[str, Any]] = {}
-    db_store: Dict[str, list] = {'sessions': []} # Initialize for local session logging simulation
+    db_store: Dict[str, list] = {'sessions': []}
 
 # --- API Simulation ---
 async def fetch_api_data(url: str, method: str = 'POST', data: Optional[Dict] = None) -> Optional[Dict]:
@@ -46,7 +45,7 @@ async def fetch_api_data(url: str, method: str = 'POST', data: Optional[Dict] = 
                         "lastLocation": "A Private Experience",
                         "placeId": 0, # Often 0 or None for private
                         "rootPlaceId": None,
-                        "universeId": 123456, # Example Universe ID (can be used as fallback)
+                        "universeId": 123456, # Example Universe ID (used as fallback)
                         "userId": USER_ID_TO_TRACK,
                         "lastOnline": f"{time.time()}"
                     }
@@ -56,14 +55,15 @@ async def fetch_api_data(url: str, method: str = 'POST', data: Optional[Dict] = 
             return raw_data
         return {"userPresences": []}
     
-    # Simulating the game detail lookup (if needed, though not strictly used in current logic)
-    elif ROBLOX_GAME_DETAIL_URL in url:
-        if data and data.get('placeIds'):
-            place_id = data['placeIds'][0]
-            if place_id != 0:
-                 return [{"placeId": place_id, "name": f"Mega Awesome Game ({place_id})", "universeId": 123456}]
-            else:
-                 return [{"placeId": 0, "name": "Private Server", "universeId": 0}]
+    # Simulating the game detail lookup
+    elif ROBLOX_GAME_DETAIL_URL in url and data and data.get('placeIds'):
+        place_id = data['placeIds'][0]
+        if place_id != 0:
+             # If placeId is non-zero, return a real game name
+             return [{"placeId": place_id, "name": f"Mega Awesome Game ({place_id})", "universeId": 123456}]
+        else:
+             # If placeId is 0, this lookup is usually futile, return minimal info
+             return [{"placeId": 0, "name": "Private Server", "universeId": 0}]
     return None
 
 # --- Tracker Class ---
@@ -76,35 +76,20 @@ class RobloxTracker:
         self.db = db_client
         self.db_collection = "roblox_sessions"
         
-        # In-memory cache for local simulation/initial state
-        user_id_str = str(self.user_id)
+        # In-memory cache pointers for local simulation
         if not IS_FIREBASE_AVAILABLE:
             self._user_tracking_cache = user_tracking_cache
             self._db_store = db_store
         else:
-            self._user_tracking_cache: Dict[str, Any] = {} # Standardizing internal cache even with FB
+            self._user_tracking_cache: Dict[int, Any] = {}
             self._db_store: Dict[str, list] = {'sessions': []}
 
+
     # --- Persistence Layer ---
+    # (Simplified for simulation. Real FB code is commented out.)
 
     async def get_user_tracking_status(self) -> Dict[str, Any]:
         """Retrieves the current tracking status, either from Firestore or cache."""
-        user_id_str = str(self.user_id)
-        
-        if IS_FIREBASE_AVAILABLE and self.db:
-            # Firestore implementation: Get the single tracking document
-            try:
-                doc_ref = self.db.collection('roblox_tracker').document(user_id_str)
-                # Note: In a real async Python Firebase setup, you'd use an async wrapper 
-                # (like google-cloud-firestore or a custom solution) for `await doc_ref.get()`.
-                # For this environment, we rely on the simulation or assume synchronous operations
-                # are wrapped/stubbed correctly.
-                # doc = await doc_ref.get() 
-                # if doc.exists:
-                #     return doc.to_dict()
-                pass 
-            except Exception as e:
-                logging.error(f"Firestore read error: {e}")
         
         # Fallback to in-memory cache or default state
         if not IS_FIREBASE_AVAILABLE:
@@ -132,16 +117,10 @@ class RobloxTracker:
 
     async def update_user_tracking_status(self, status: Dict[str, Any]):
         """Updates the current tracking status in Firestore or cache."""
-        user_id_str = str(self.user_id)
-
         if IS_FIREBASE_AVAILABLE and self.db:
-            try:
-                doc_ref = self.db.collection('roblox_tracker').document(user_id_str)
-                # await doc_ref.set(status) 
-                pass
-            except Exception as e:
-                logging.error(f"Firestore write error (status update): {e}")
-
+            # Firestore implementation here...
+            pass
+        
         # Update cache for local use/immediate next read (only used in simulation mode)
         if not IS_FIREBASE_AVAILABLE:
             self._user_tracking_cache[self.user_id] = status
@@ -152,13 +131,8 @@ class RobloxTracker:
         """Logs a completed session to Firestore or in-memory store."""
         
         if IS_FIREBASE_AVAILABLE and self.db:
-            # Firestore implementation: Add a new session document to the collection
-            try:
-                col_ref = self.db.collection(self.db_collection)
-                # await col_ref.add(session_log)
-                pass
-            except Exception as e:
-                logging.error(f"Firestore write error (session log): {e}")
+            # Firestore implementation here...
+            pass
 
         # Local simulation logging
         if not IS_FIREBASE_AVAILABLE:
@@ -174,6 +148,7 @@ class RobloxTracker:
         if place_id != 0:
              # Use the simulation function for consistency.
             try:
+                # IMPORTANT: Use place_id for the lookup, not the user's ID
                 response = await fetch_api_data(
                     ROBLOX_GAME_DETAIL_URL, 
                     method='POST',
@@ -183,7 +158,9 @@ class RobloxTracker:
                     game_name = response[0]['name']
             except Exception as e:
                 logging.warning(f"Could not fetch game name for ID {place_id}. Error: {e}")
-                
+        
+        # If place_id is 0, we intentionally return a generic name, 
+        # but if the API call in fetch_api_data returned a name for a non-zero ID, it's used.
         return place_id, game_name
 
     async def _parse_presence(self, user_presence: Dict[str, Any]) -> Tuple[bool, int, str]:
@@ -201,8 +178,14 @@ class RobloxTracker:
         game_name = user_presence.get("lastLocation", "N/A")
 
         # Optional: Attempt to fetch a better game name if ID is present and location is generic
+        # NOTE: If active_game_id is the universeId (123456), this lookup will happen.
+        # It's better to keep the lastLocation if it's descriptive.
         if active_game_id != 0 and game_name in ["A Private Experience", "N/A"]:
             active_game_id, game_name = await self._get_game_details(active_game_id)
+        elif active_game_id == 0:
+             # If the game ID is 0, we treat it as an unidentifiable private experience.
+             game_name = user_presence.get("lastLocation", "Unidentified Private Experience")
+
 
         return is_playing, active_game_id, game_name
 
@@ -332,13 +315,14 @@ class RobloxTracker:
 # --- Main Async Runner ---
 async def main():
     """Initializes the tracker and runs the continuous loop."""
+    # Set logging level to DEBUG to see more details, including the simulation data/flow
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
     # Initialize the tracker instance
     tracker = RobloxTracker(
         user_id=USER_ID_TO_TRACK, 
         user_name=USER_NAME, 
-        db_client=db # Now safely passes None if Firebase is not available
+        db_client=db # Safely passes None if Firebase is not available
     )
     
     # Run the initial check (in case we stop after the first run)
