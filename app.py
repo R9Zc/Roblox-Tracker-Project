@@ -51,8 +51,7 @@ def get_cached_status(worksheet):
         logging.error(f"Error loading cache from Sheet: {e}")
         
     # Default state for new or empty cache
-    # V17 Cache stores 'universe_id' as the authoritative ID
-    default_state = {"playing": False, "game_name": "Offline", "start_time_utc": None, "universe_id": 0}
+    default_state = {"playing": False, "game_name": "Offline", "start_time_utc": None, "active_game_id": 0}
     return {uid: default_state for uid in FRIENDS_TO_TRACK}
 
 def save_cached_status(worksheet, status_data):
@@ -74,7 +73,7 @@ def check_roblox_status(user_ids):
         presence = response.json().get('userPresences', [])
         current_status = {}
         
-        # V17: Log to capture the RAW JSON response (just in case)
+        # V19: Log to capture the RAW JSON response (for final confirmation)
         raw_api_data = {"userPresences": presence}
         logging.info(f"API Raw Response: {json.dumps(raw_api_data)}") 
         
@@ -85,31 +84,59 @@ def check_roblox_status(user_ids):
             is_playing = item['userPresenceType'] in [1, 2, 3] 
             user_presence_type = item['userPresenceType'] 
             
-            # --- V17: Use universeId as the primary game identifier ---
-            # universeId is often returned even when placeId is 0 or None.
-            # We default it to 0 if it's not present or is None.
-            universe_id = item.get('universeId')
-            universe_id_for_cache = universe_id if universe_id is not None else 0
+            # --- V19: TRIPLE ID CHECK ---
+            active_game_id = 0
+            id_type = ""
             
-            # Determine if they are in a real game (Playing AND Universe ID must be > 0)
-            is_in_real_game = is_playing and universe_id_for_cache != 0
+            # 1. Check universeId (most common reliable ID for a game)
+            universe_id = item.get('universeId')
+            if universe_id is not None and universe_id != 0:
+                active_game_id = universe_id
+                id_type = "Universe ID"
+            
+            # 2. Check rootPlaceId (ID of the starting place in a game)
+            elif active_game_id == 0:
+                root_place_id = item.get('rootPlaceId')
+                if root_place_id is not None and root_place_id != 0:
+                    active_game_id = root_place_id
+                    id_type = "Root Place ID"
+
+            # 3. Check placeId (ID of the current specific server/place)
+            elif active_game_id == 0:
+                place_id = item.get('placeId')
+                if place_id is not None and place_id != 0:
+                    active_game_id = place_id
+                    id_type = "Place ID"
+            
+            # --- END TRIPLE ID CHECK ---
+            
+            # Default display name
+            display_game_name = "Unknown"
+
+            # Determine if they are in a real game (Playing AND found a valid ID > 0)
+            is_in_real_game = is_playing and active_game_id != 0
 
             if user_presence_type == 0:
                 display_game_name = "Offline"
             elif is_playing:
                 if is_in_real_game:
-                    # Log the Universe ID if we find one
-                    display_game_name = f"Universe ID: {universe_id_for_cache}" 
+                    # Found an ID: Log the ID type and value
+                    display_game_name = f"{id_type}: {active_game_id}" 
                 else:
-                    # They are on the website or just online (or placeId/universeId is 0/None)
-                    display_game_name = "Website/Online"
-            else:
-                display_game_name = "Unknown" 
-
+                    # V19 FALLBACK: No ID was found, but they are playing.
+                    # Check the 'lastLocation' text field as a last resort.
+                    last_location = item.get('lastLocation')
+                    if last_location and last_location.strip() not in ["", "Website", "Unknown"]:
+                        # If lastLocation contains meaningful text, use it.
+                        display_game_name = f"Text Name: {last_location}"
+                    else:
+                        # Otherwise, fall back to "Website/Online" or "Game ID Hidden"
+                        display_game_name = "Game ID Hidden"
+            
             current_status[uid] = {
                 "playing": is_playing, 
                 "game_name": display_game_name, 
-                "universe_id": universe_id_for_cache # Store the authoritative ID
+                "active_game_id": active_game_id # Store the authoritative ID (0 if not found)
             }
             
         return current_status
@@ -163,39 +190,40 @@ def execute_tracking():
 
     # --- COMPARE AND LOG CHANGES ---
     for uid, friend_name in FRIENDS_TO_TRACK.items():
-        # V17: Default now uses universe_id
-        cached_default = {"playing": False, "game_name": "Offline", "start_time_utc": None, "universe_id": 0}
+        # V19: Default now uses active_game_id
+        cached_default = {"playing": False, "game_name": "Offline", "start_time_utc": None, "active_game_id": 0}
         cached = cached_status.get(uid, cached_default)
-        current = current_roblox_status.get(uid, {"playing": False, "game_name": "Offline", "universe_id": 0})
+        current = current_roblox_status.get(uid, {"playing": False, "game_name": "Offline", "active_game_id": 0})
         
         new_cache[uid] = cached.copy()
         
-        # V17: Determine if the user is in a state with a non-zero UNIVERSE ID
-        cached_in_game_id = cached['playing'] and cached['universe_id'] != 0
-        current_in_game_id = current['playing'] and current['universe_id'] != 0
+        # V19: Determine if the user is in a state with a non-zero ACTIVE GAME ID
+        # Note: If active_game_id is 0, we still check game_name because it might contain the text fallback
+        cached_is_tracking = cached['playing'] and cached['game_name'] not in ("Offline", "Website/Online", "Game ID Hidden")
+        current_is_tracking = current['playing'] and current['game_name'] not in ("Offline", "Website/Online", "Game ID Hidden")
         
-        # --- V17: Internal Logic Debug Log ---
-        log_message = f"[{friend_name}] Cache State: playing={cached['playing']}, uID={cached['universe_id']} | Current State: playing={current['playing']}, uID={current['universe_id']}"
+        # --- V19: Internal Logic Debug Log ---
+        log_message = f"[{friend_name}] Cache State: playing={cached['playing']}, gName='{cached['game_name']}' | Current State: playing={current['playing']}, gName='{current['game_name']}'"
         logging.info(log_message)
         # -------------------------------------
 
 
-        # 1. STARTED PLAYING A REAL GAME (No Universe ID -> Has Universe ID)
-        if not cached_in_game_id and current_in_game_id:
+        # 1. STARTED PLAYING A REAL GAME (No Tracking -> Has Tracking)
+        if not cached_is_tracking and current_is_tracking:
             action = "STARTED PLAYING"
-            game = current['game_name'] # Will be "Universe ID: XXX"
+            game = current['game_name'] 
             logs_to_write.append([timestamp_log_str, friend_name, action, game, ""]) 
             
             new_cache[uid]["playing"] = True
             new_cache[uid]["game_name"] = current['game_name']
-            new_cache[uid]["universe_id"] = current['universe_id']
+            new_cache[uid]["active_game_id"] = current['active_game_id']
             new_cache[uid]["start_time_utc"] = timestamp_cache_str
             logging.info(f"[{friend_name}] -> LOGGING START (Path 1)") 
 
-        # 2. STOPPED PLAYING A REAL GAME (Has Universe ID -> No Universe ID OR Offline)
-        elif cached_in_game_id and not current_in_game_id:
+        # 2. STOPPED PLAYING A REAL GAME (Has Tracking -> No Tracking OR Offline)
+        elif cached_is_tracking and not current_is_tracking:
             action = "STOPPED PLAYING"
-            game = cached['game_name'] # Use cached name (Universe ID: XXX) for the log
+            game = cached['game_name'] # Use cached name for the log
             duration_minutes = ""
             
             if cached['start_time_utc']:
@@ -211,13 +239,13 @@ def execute_tracking():
             
             new_cache[uid]["playing"] = current['playing']
             new_cache[uid]["game_name"] = current['game_name']
-            new_cache[uid]["universe_id"] = current['universe_id'] # Store the new universe_id (0)
+            new_cache[uid]["active_game_id"] = current['active_game_id'] 
             new_cache[uid]["start_time_utc"] = None
             logging.info(f"[{friend_name}] -> LOGGING STOP (Path 2)") 
 
-        # 3. GAME CHANGED (While playing A game)
-        # Check if they are still in a game ID state AND the universe ID changed
-        elif cached_in_game_id and current_in_game_id and current['universe_id'] != cached['universe_id']:
+        # 3. GAME CHANGED (While playing A game that is being tracked)
+        # Compare game_name or active_game_id for a switch
+        elif cached_is_tracking and current_is_tracking and current['game_name'] != cached['game_name']:
             # Log the stop of the old game and the start of the new one
             # STOP LOG
             stop_action = "STOPPED PLAYING"
@@ -230,21 +258,27 @@ def execute_tracking():
             logs_to_write.append([timestamp_log_str, friend_name, start_action, start_game, ""])
             
             new_cache[uid]["game_name"] = current['game_name']
-            new_cache[uid]["universe_id"] = current['universe_id']
+            new_cache[uid]["active_game_id"] = current['active_game_id']
             new_cache[uid]["start_time_utc"] = timestamp_cache_str
             logging.info(f"[{friend_name}] -> LOGGING GAME SWITCH (Path 3)") 
 
-        # 4. Website/Online State Flip (No log, but update cache to reflect current status)
-        elif not cached_in_game_id and not current_in_game_id:
-            # Update cache to flip between Offline, Website/Online, etc., silently
+        # 4. State Flip (No log, but update cache to reflect current status, even if it's "Game ID Hidden")
+        else:
+            # This path handles: No tracking change, or switching between Offline/Website/Game ID Hidden
+            # Silent update to keep the cache fresh.
             new_cache[uid]["playing"] = current['playing']
             new_cache[uid]["game_name"] = current['game_name']
-            new_cache[uid]["universe_id"] = current['universe_id']
-            logging.info(f"[{friend_name}] -> SILENT CACHE UPDATE (Path 4)") 
-        
-        # 5. Otherwise, no meaningful change to track
-        else:
-            logging.info(f"[{friend_name}] -> NO CHANGE (Path 5)")
+            new_cache[uid]["active_game_id"] = current['active_game_id']
+            
+            # If they just stopped playing, clear start_time_utc
+            if not current['playing'] or current['game_name'] in ("Offline", "Website/Online", "Game ID Hidden"):
+                new_cache[uid]["start_time_utc"] = None
+            else:
+                 # If they are currently playing and we just started tracking them, but we don't have a start time, set one.
+                if new_cache[uid]["start_time_utc"] is None:
+                    new_cache[uid]["start_time_utc"] = timestamp_cache_str
+
+            logging.info(f"[{friend_name}] -> SILENT CACHE UPDATE (Path 4/5)") 
             
     # --- WRITE LOGS AND SAVE CACHE ---
     if logs_to_write:
