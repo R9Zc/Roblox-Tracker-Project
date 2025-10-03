@@ -24,12 +24,11 @@ FRIENDS_TO_TRACK = {
 }
 
 ROBLOX_STATUS_URL = "https://presence.roblox.com/v1/presence/users"
-ROBLOX_GAME_BULK_URL = "https://games.roblox.com/v1/games/multiget-info"
+# ROBLOX_GAME_BULK_URL (Universe ID lookup) removed as we now use multiget-place-details
 DATA_SHEET_NAME = "Activity Log"
 CACHE_SHEET_NAME = "Cache"
 
 NON_TRACKING_STATES = ("Offline", "Game ID Hidden", "Website", "Unknown", "ID Lookup Failed")
-
 
 # ------------------- Helper Functions -------------------
 def get_cached_status(worksheet):
@@ -43,7 +42,6 @@ def get_cached_status(worksheet):
     default_state = {"playing": False, "game_name": "Offline", "start_time_utc": None, "active_game_id": 0}
     return {uid: default_state for uid in FRIENDS_TO_TRACK}
 
-
 def save_cached_status(worksheet, status_data):
     """Writes the current status to the Cache sheet (Cell A2)."""
     try:
@@ -51,41 +49,53 @@ def save_cached_status(worksheet, status_data):
     except Exception as e:
         logging.error(f"Error saving cache: {e}")
 
-
-def get_game_names_bulk(universe_ids, retries=2, delay=1):
-    """Fetches game names using POST JSON for reliability."""
-    if not universe_ids:
+def get_game_names_bulk(place_ids, retries=2, delay=1):
+    """
+    V24 Update: Fetches game names using Roblox API (multiget-place-details) by Place ID.
+    The response is mapped by Place ID to match the lookup key.
+    """
+    if not place_ids:
         return {}
+
+    # This endpoint uses GET request with comma-separated IDs in the query string
+    url = "https://games.roblox.com/v1/games/multiget-place-details?placeIds=" + ",".join(map(str, place_ids))
+
     for attempt in range(retries):
         try:
-            resp = requests.post(
-                ROBLOX_GAME_BULK_URL,
-                json={"universeIds": universe_ids},
-                timeout=5
-            )
+            resp = requests.get(url, timeout=5)
             resp.raise_for_status()
-            data = resp.json()
-            return {g['universeId']: g['name'] for g in data if 'universeId' in g and 'name' in g}
+            data = resp.json().get("data", [])
+            
+            # Map the Place ID ('id' in the response) to the game name
+            result = {}
+            for game in data:
+                place_id_key = game.get("id")
+                name = game.get("name", "Unknown Game")
+                if place_id_key:
+                    result[place_id_key] = name
+            return result
         except Exception as e:
             logging.warning(f"Bulk game fetch attempt {attempt+1} failed: {e}")
             if attempt < retries - 1:
                 time.sleep(delay)
     return {}
 
-
 def check_roblox_status(user_ids):
     """Fetches current status from Roblox and determines game names."""
     try:
+        # 1. Fetch presence data
         resp = requests.post(ROBLOX_STATUS_URL, json={"userIds": list(user_ids)}, timeout=10)
         resp.raise_for_status()
         presence = resp.json().get('userPresences', [])
 
-        universe_ids = {item.get('universeId') for item in presence if item.get('universeId') not in (None, 0)}
-        game_name_map = get_game_names_bulk(list(universe_ids))
+        # 2. Collect placeIds for bulk fetch (V24 change)
+        place_ids = {item.get('placeId') for item in presence if item.get('placeId') not in (None, 0)}
+        game_name_map = get_game_names_bulk(list(place_ids))
 
         status = {}
         for item in presence:
             uid = item['userId']
+            # userPresenceType: 1=Online, 2=In Game, 3=In Studio
             is_playing = item['userPresenceType'] in [1, 2, 3]
 
             universe_id = item.get('universeId')
@@ -93,27 +103,31 @@ def check_roblox_status(user_ids):
             place_id = item.get('placeId')
             last_location = item.get('lastLocation')
 
+            # Prioritize Universe ID for active_game_id for consistency, falling back to place/root
             active_game_id = universe_id or root_place_id or place_id or 0
             display_name = "Offline"
 
             if is_playing:
-                if universe_id in game_name_map:
-                    display_name = game_name_map[universe_id]
+                # V24 Change: Lookup by place_id
+                if place_id in game_name_map:
+                    # Case A: Place ID found and name successfully fetched
+                    display_name = game_name_map[place_id]
                 elif last_location and last_location.strip() not in ("", "Website", "Unknown", None):
+                    # Case B: No ID, fallback to last location text
                     display_name = last_location
                 else:
+                    # Case C: Playing, but restricted/hidden
                     display_name = "Game ID Hidden"
 
             status[uid] = {
                 "playing": is_playing,
-                "game_name": display_name or "Unknown Game",
+                "game_name": display_name or "Unknown Game", 
                 "active_game_id": active_game_id
             }
         return status
     except Exception as e:
         logging.error(f"Roblox API check failed: {e}")
         return {}
-
 
 # ------------------- Main Tracking -------------------
 def execute_tracking():
@@ -144,6 +158,7 @@ def execute_tracking():
     ts_cache = now_utc.strftime("%Y-%m-%d %H:%M:%S+00:00")
 
     for uid, name in FRIENDS_TO_TRACK.items():
+        # Shorthand for cached (c) and current (u) data
         c = cached.get(uid, {"playing": False, "game_name": "Offline", "start_time_utc": None, "active_game_id": 0})
         u = current.get(uid, {"playing": False, "game_name": "Offline", "active_game_id": 0})
         new_cache[uid] = c.copy()
@@ -153,6 +168,7 @@ def execute_tracking():
 
         logging.info(f"[{name}] Cache: {c['game_name']} | Current: {u['game_name']}")
 
+        # START: Not tracked -> Tracked
         if not cached_tracking and current_tracking:
             logs.append([ts_log, name, "STARTED PLAYING", u['game_name'], ""])
             new_cache[uid].update({
@@ -161,7 +177,8 @@ def execute_tracking():
                 "active_game_id": u['active_game_id'],
                 "start_time_utc": ts_cache
             })
-
+        
+        # STOP: Tracked -> Not tracked (or Offline)
         elif cached_tracking and not current_tracking:
             duration = ""
             if c['start_time_utc']:
@@ -170,7 +187,7 @@ def execute_tracking():
                     duration = round((now_utc - start_dt).total_seconds() / 60, 2)
                 except Exception as e:
                     logging.error(f"Duration calc error: {e}")
-
+                    
             logs.append([ts_log, name, "STOPPED PLAYING", c['game_name'], duration])
             new_cache[uid].update({
                 "playing": u['playing'],
@@ -178,7 +195,8 @@ def execute_tracking():
                 "active_game_id": u['active_game_id'],
                 "start_time_utc": None
             })
-
+            
+        # SWITCH: Tracked -> Tracked, but game name OR ID changed
         elif cached_tracking and current_tracking and (u['game_name'] != c['game_name'] or u['active_game_id'] != c['active_game_id']):
             logs.append([ts_log, name, "STOPPED PLAYING", c['game_name'], ""])
             logs.append([ts_log, name, "STARTED PLAYING", u['game_name'], ""])
@@ -187,7 +205,8 @@ def execute_tracking():
                 "active_game_id": u['active_game_id'],
                 "start_time_utc": ts_cache
             })
-
+            
+        # SILENT UPDATE: Continuous session or continuous non-tracking
         else:
             new_cache[uid].update({
                 "playing": u['playing'],
@@ -207,11 +226,13 @@ def execute_tracking():
 @app.route('/')
 @app.route('/track')
 def track_route():
+    """Primary endpoint to execute the tracking logic."""
     return execute_tracking()
 
 
 @app.route('/status')
 def status_route():
+    """Returns the live cache state as a JSON response for debugging."""
     try:
         creds_json = os.environ.get('GOOGLE_CREDENTIALS')
         if not creds_json:
@@ -222,6 +243,7 @@ def status_route():
         cache_ws = spreadsheet.worksheet(CACHE_SHEET_NAME)
 
         cached_data = get_cached_status(cache_ws)
+        # Map user IDs to friendly names for better debugging output
         friendly_output = {FRIENDS_TO_TRACK.get(uid, str(uid)): data for uid, data in cached_data.items()}
 
         return jsonify(friendly_output)
