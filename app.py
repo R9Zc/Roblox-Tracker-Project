@@ -11,9 +11,10 @@ USER_NAME = "Hulk_Tracker" # User name for logging
 ROBLOX_PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
 ROBLOX_GAME_DETAIL_URL = "https://games.roblox.com/v1/games/multiget-place-details"
 
-# --- SIMULATION CONTROL STATE (NEW) ---
+# --- SIMULATION CONTROL STATE ---
 # Set to "OFFLINE" to simulate the user not being in a game.
 # Set to "PLAYING" to simulate the user starting a game.
+# Change this variable to test different states.
 SIMULATION_STATE = "OFFLINE" 
 
 # --- Firebase Initialization (Required for Canvas) ---
@@ -135,6 +136,8 @@ class RobloxTracker:
 
     async def update_user_tracking_status(self, status: Dict[str, Any]):
         """Updates the current tracking status in Firestore or cache."""
+        # This function updates the cache/database only when the script runs, 
+        # storing the current state for the next run's comparison.
         if IS_FIREBASE_AVAILABLE and self.db:
             # Firestore implementation here...
             pass
@@ -147,6 +150,7 @@ class RobloxTracker:
 
     async def log_session_end(self, session_log: Dict[str, Any]):
         """Logs a completed session to Firestore or in-memory store."""
+        # This function logs a session ONLY when an END or SWITCH event occurs.
         
         if IS_FIREBASE_AVAILABLE and self.db:
             # Firestore implementation here...
@@ -194,29 +198,27 @@ class RobloxTracker:
 
         # Logic to generate the immediate game name for logging
         if not is_playing:
-            game_name = "N/A"
+            game_name = "Website / Offline" # Clearer name for non-playing state
         elif active_game_id == 0:
-            # Case: Playing, but no identifiable ID (e.g., in Studio, or truly private status)
+            # Case: Playing, but no identifiable ID
             game_name = user_presence.get("lastLocation", "Unidentifiable Experience")
         else:
             # Case: Playing and we have an ID (universeId or placeId)
             
             # 1. Attempt to get the actual name if the location is generic
             if game_name in ["A Private Experience", "N/A", ""]:
-                # Set it to "Searching Game" initially
-                game_name = "Searching Game" 
+                game_name_base = "Searching Game" 
                 
                 # Fetch actual details if ID is available
                 fetched_game_id, fetched_game_name = await self._get_game_details(active_game_id)
 
                 if fetched_game_name not in ["Unknown Game", "Private Server"]:
-                    game_name = fetched_game_name
+                    game_name_base = fetched_game_name
+            else:
+                game_name_base = game_name
 
-            # 2. Add the Game ID to the name for clear logging (New Requirement)
-            game_name = f"{game_name} [ID: {active_game_id}]"
-
-        # Note: If is_playing is True, active_game_id will be 123456 in the simulation, 
-        # leading to "Searching Game [ID: 123456]" (due to the simulation's return value).
+            # 2. Add the Game ID to the name for clear logging
+            game_name = f"{game_name_base} [ID: {active_game_id}]"
 
         return is_playing, active_game_id, game_name
 
@@ -265,33 +267,30 @@ class RobloxTracker:
         if not cached_tracking and current_tracking:
             u['session_start'] = current_time
             u['session_id'] = f"SESS_{self.user_id}_{current_time}"
-            logging.info(f"START Session: {u['user_name']} in game: {u['game_name']}") # Use new formatted game_name
+            logging.info(f"START Session: {u['user_name']} in game: {u['game_name']}") 
             await self.update_user_tracking_status(u)
             
         # 2. END SESSION: Was playing -> Now not playing
         elif cached_tracking and not current_tracking:
             if c['session_start'] is None:
                 logging.warning("No session_start found for an ending session. Data inconsistency.")
-                u['session_start'] = None
-                u['session_id'] = None
-                await self.update_user_tracking_status(u)
-                return
-                
-            session_duration = current_time - c['session_start']
-            session_log = {
-                'user_id': c['user_id'],
-                'user_name': c['user_name'],
-                'game_id': cached_game_id,
-                'game_name': c['game_name'],
-                'start_time': c['session_start'],
-                'end_time': current_time,
-                'duration_seconds': session_duration,
-                'duration_minutes': session_duration / 60.0,
-                'session_id': c['session_id']
-            }
-            logging.info(f"END Session: {u['user_name']} left. Duration: {session_log['duration_minutes']:.2f} mins.")
-            await self.log_session_end(session_log)
+            else:
+                session_duration = current_time - c['session_start']
+                session_log = {
+                    'user_id': c['user_id'],
+                    'user_name': c['user_name'],
+                    'game_id': cached_game_id,
+                    'game_name': c['game_name'],
+                    'start_time': c['session_start'],
+                    'end_time': current_time,
+                    'duration_seconds': session_duration,
+                    'duration_minutes': session_duration / 60.0,
+                    'session_id': c['session_id']
+                }
+                logging.info(f"END Session: {u['user_name']} left. Duration: {session_log['duration_minutes']:.2f} mins.")
+                await self.log_session_end(session_log)
             
+            # Reset state for cache
             u['session_start'] = None
             u['session_id'] = None
             await self.update_user_tracking_status(u)
@@ -320,19 +319,21 @@ class RobloxTracker:
             # Start new session (Game B)
             u['session_start'] = current_time
             u['session_id'] = f"SESS_{self.user_id}_{current_time}"
-            logging.info(f"START Session: {u['user_name']} in NEW game: {u['game_name']}") # Use new formatted game_name
+            logging.info(f"START Session: {u['user_name']} in NEW game: {u['game_name']}") 
             await self.update_user_tracking_status(u)
             
-        # 4. CONTINUE SESSION: Playing (Game A) -> Still Playing (Game A) or not playing -> still not playing
+        # 4. CONTINUE / IDLE: State is the same as the cache. No log or update needed.
         else:
-            # If playing, ensure session details (start/id) persist in the cache
             if current_tracking:
+                # Still playing the same game: just keep old session details
                 u['session_start'] = c['session_start']
                 u['session_id'] = c['session_id']
-                logging.debug(f"CONTINUE Session: {u['user_name']}")
+                logging.debug(f"CONTINUE Session: {u['user_name']} in {u['game_name']}")
             else:
-                logging.debug(f"IDLE: {u['user_name']}")
+                # Still Offline/Website: nothing has changed
+                logging.debug(f"IDLE: {u['user_name']} is offline/on website.")
                 
+            # The cache is updated regardless, but no session is logged.
             await self.update_user_tracking_status(u)
         
         # Display simulated log if not using Firebase
@@ -353,11 +354,8 @@ async def main():
     tracker = RobloxTracker(
         user_id=USER_ID_TO_TRACK, 
         user_name=USER_NAME, 
-        db_client=db # Safely passes None if Firebase is not available
+        db_client=db 
     )
-    
-    # Run the initial check (in case we stop after the first run)
-    await tracker.execute_tracking()
     
     # Run the continuous tracking loop
     while True:
@@ -366,15 +364,18 @@ async def main():
         await asyncio.sleep(LOGGING_INTERVAL_SECONDS)
 
 if __name__ == '__main__':
+    # You can change SIMULATION_STATE at the top of the file to test transitions:
+    # 1. Set SIMULATION_STATE = "OFFLINE" and run: Should show IDLE logs.
+    # 2. Stop, set SIMULATION_STATE = "PLAYING" and run: Should show START Session log.
+    # 3. Run again: Should show CONTINUE Session logs.
+    # 4. Stop, set SIMULATION_STATE = "OFFLINE" and run: Should show END Session log.
     try:
-        # To test the start session, set SIMULATION_STATE = "PLAYING" here, run, then stop.
-        # To test the end session, ensure the cache is set (by running PLAYING first), 
-        # then set SIMULATION_STATE = "OFFLINE" and run again.
         asyncio.run(main())
     except RuntimeError as e:
         if "Event loop is closed" in str(e):
-            print("Tracking completed (simulated).")
+            print("Tracker completed.")
         else:
             raise
     except KeyboardInterrupt:
         print("\nTracker stopped by user.")
+
