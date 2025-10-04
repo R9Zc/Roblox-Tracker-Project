@@ -11,6 +11,11 @@ USER_NAME = "Hulk_Tracker" # User name for logging
 ROBLOX_PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
 ROBLOX_GAME_DETAIL_URL = "https://games.roblox.com/v1/games/multiget-place-details"
 
+# --- SIMULATION CONTROL STATE (NEW) ---
+# Set to "OFFLINE" to simulate the user not being in a game.
+# Set to "PLAYING" to simulate the user starting a game.
+SIMULATION_STATE = "OFFLINE" 
+
 # --- Firebase Initialization (Required for Canvas) ---
 db = None # Initialize db globally to prevent NameError if firebase_admin import fails
 try:
@@ -33,19 +38,32 @@ if not IS_FIREBASE_AVAILABLE:
 # --- API Simulation ---
 async def fetch_api_data(url: str, method: str = 'POST', data: Optional[Dict] = None) -> Optional[Dict]:
     """Simulates API fetch with a realistic delay and data structure."""
+    global SIMULATION_STATE # Access the global control variable
     await asyncio.sleep(0.5)
 
     if url == ROBLOX_PRESENCE_URL:
         if data and data.get('userIds') == [USER_ID_TO_TRACK]:
-            # Simulate being in a private or unknown experience (common case)
+            
+            # --- Dynamically set presence based on SIMULATION_STATE ---
+            if SIMULATION_STATE == "PLAYING":
+                presence_type = 2 # InGame
+                last_location = "A Private Experience"
+                place_id = 0
+                universe_id = 123456
+            else:
+                presence_type = 0 # Offline/Website
+                last_location = "Website"
+                place_id = 0
+                universe_id = 0
+                
             raw_data = {
                 "userPresences": [
                     {
-                        "userPresenceType": 2, # 2 means InGame
-                        "lastLocation": "A Private Experience",
-                        "placeId": 0, # Often 0 or None for private
+                        "userPresenceType": presence_type,
+                        "lastLocation": last_location,
+                        "placeId": place_id,
                         "rootPlaceId": None,
-                        "universeId": 123456, # Example Universe ID (used as fallback)
+                        "universeId": universe_id,
                         "userId": USER_ID_TO_TRACK,
                         "lastOnline": f"{time.time()}"
                     }
@@ -148,7 +166,6 @@ class RobloxTracker:
         if place_id != 0:
              # Use the simulation function for consistency.
             try:
-                # IMPORTANT: Use place_id for the lookup, not the user's ID
                 response = await fetch_api_data(
                     ROBLOX_GAME_DETAIL_URL, 
                     method='POST',
@@ -159,8 +176,6 @@ class RobloxTracker:
             except Exception as e:
                 logging.warning(f"Could not fetch game name for ID {place_id}. Error: {e}")
         
-        # If place_id is 0, we intentionally return a generic name, 
-        # but if the API call in fetch_api_data returned a name for a non-zero ID, it's used.
         return place_id, game_name
 
     async def _parse_presence(self, user_presence: Dict[str, Any]) -> Tuple[bool, int, str]:
@@ -177,15 +192,31 @@ class RobloxTracker:
 
         game_name = user_presence.get("lastLocation", "N/A")
 
-        # Optional: Attempt to fetch a better game name if ID is present and location is generic
-        # NOTE: If active_game_id is the universeId (123456), this lookup will happen.
-        # It's better to keep the lastLocation if it's descriptive.
-        if active_game_id != 0 and game_name in ["A Private Experience", "N/A"]:
-            active_game_id, game_name = await self._get_game_details(active_game_id)
+        # Logic to generate the immediate game name for logging
+        if not is_playing:
+            game_name = "N/A"
         elif active_game_id == 0:
-             # If the game ID is 0, we treat it as an unidentifiable private experience.
-             game_name = user_presence.get("lastLocation", "Unidentified Private Experience")
+            # Case: Playing, but no identifiable ID (e.g., in Studio, or truly private status)
+            game_name = user_presence.get("lastLocation", "Unidentifiable Experience")
+        else:
+            # Case: Playing and we have an ID (universeId or placeId)
+            
+            # 1. Attempt to get the actual name if the location is generic
+            if game_name in ["A Private Experience", "N/A", ""]:
+                # Set it to "Searching Game" initially
+                game_name = "Searching Game" 
+                
+                # Fetch actual details if ID is available
+                fetched_game_id, fetched_game_name = await self._get_game_details(active_game_id)
 
+                if fetched_game_name not in ["Unknown Game", "Private Server"]:
+                    game_name = fetched_game_name
+
+            # 2. Add the Game ID to the name for clear logging (New Requirement)
+            game_name = f"{game_name} [ID: {active_game_id}]"
+
+        # Note: If is_playing is True, active_game_id will be 123456 in the simulation, 
+        # leading to "Searching Game [ID: 123456]" (due to the simulation's return value).
 
         return is_playing, active_game_id, game_name
 
@@ -234,7 +265,7 @@ class RobloxTracker:
         if not cached_tracking and current_tracking:
             u['session_start'] = current_time
             u['session_id'] = f"SESS_{self.user_id}_{current_time}"
-            logging.info(f"START Session: {u['user_name']} in game: {u['game_name']} ({current_game_id})")
+            logging.info(f"START Session: {u['user_name']} in game: {u['game_name']}") # Use new formatted game_name
             await self.update_user_tracking_status(u)
             
         # 2. END SESSION: Was playing -> Now not playing
@@ -289,7 +320,7 @@ class RobloxTracker:
             # Start new session (Game B)
             u['session_start'] = current_time
             u['session_id'] = f"SESS_{self.user_id}_{current_time}"
-            logging.info(f"START Session: {u['user_name']} in NEW game: {u['game_name']} ({current_game_id})")
+            logging.info(f"START Session: {u['user_name']} in NEW game: {u['game_name']}") # Use new formatted game_name
             await self.update_user_tracking_status(u)
             
         # 4. CONTINUE SESSION: Playing (Game A) -> Still Playing (Game A) or not playing -> still not playing
@@ -336,7 +367,9 @@ async def main():
 
 if __name__ == '__main__':
     try:
-        # We only run main() to handle the loop and ensure one tracker check before the loop starts
+        # To test the start session, set SIMULATION_STATE = "PLAYING" here, run, then stop.
+        # To test the end session, ensure the cache is set (by running PLAYING first), 
+        # then set SIMULATION_STATE = "OFFLINE" and run again.
         asyncio.run(main())
     except RuntimeError as e:
         if "Event loop is closed" in str(e):
