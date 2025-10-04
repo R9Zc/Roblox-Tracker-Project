@@ -3,6 +3,9 @@ import json
 import logging
 import time
 from typing import Dict, Any, Optional, Tuple
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import os # Import os for environmental variables
 
 # --- Configuration ---
 LOGGING_INTERVAL_SECONDS = 60 # Check Roblox presence every minute
@@ -14,32 +17,34 @@ ROBLOX_GAME_DETAIL_URL = "https://games.roblox.com/v1/games/multiget-place-detai
 # --- SIMULATION CONTROL STATE ---
 # Set to "OFFLINE" to simulate the user not being in a game.
 # Set to "PLAYING" to simulate the user starting a game.
-# Change this variable to test different states.
 SIMULATION_STATE = "OFFLINE" 
 
+# --- Web Server Configuration for Render Health Check ---
+# Read the port from the environment variable provided by Render, defaulting to 8080.
+DUMMY_WEB_SERVER_PORT = int(os.environ.get('PORT', 8080))
+DUMMY_WEB_SERVER_HOST = '0.0.0.0'
+
 # --- Firebase Initialization (Required for Canvas) ---
-db = None # Initialize db globally to prevent NameError if firebase_admin import fails
+db = None 
 try:
-    # IMPORTANT: Ensure firebase_admin is installed: pip install firebase-admin
     from firebase_admin import initialize_app, firestore, credentials
     # If using Firebase Admin SDK, uncomment the lines below:
     # app = initialize_app(credentials.Certificate("serviceAccountKey.json"))
     # db = firestore.client()
-    IS_FIREBASE_AVAILABLE = False # Set to True if app initialization is successful
+    IS_FIREBASE_AVAILABLE = False 
 except (ImportError, NameError):
     IS_FIREBASE_AVAILABLE = False
     print("Firebase Admin SDK not available. Using in-memory store for simulation.")
 
 # --- API Simulation (In-memory store for simulation) ---
 if not IS_FIREBASE_AVAILABLE:
-    # These global variables are used by the tracker in simulation mode
     user_tracking_cache: Dict[int, Dict[str, Any]] = {}
     db_store: Dict[str, list] = {'sessions': []}
 
 # --- API Simulation ---
 async def fetch_api_data(url: str, method: str = 'POST', data: Optional[Dict] = None) -> Optional[Dict]:
     """Simulates API fetch with a realistic delay and data structure."""
-    global SIMULATION_STATE # Access the global control variable
+    global SIMULATION_STATE
     await asyncio.sleep(0.5)
 
     if url == ROBLOX_PRESENCE_URL:
@@ -87,6 +92,7 @@ async def fetch_api_data(url: str, method: str = 'POST', data: Optional[Dict] = 
 
 # --- Tracker Class ---
 class RobloxTracker:
+    # ... (Rest of the class methods remain the same) ...
     """Encapsulates the logic and state for tracking a single Roblox user."""
 
     def __init__(self, user_id: int, user_name: str, db_client: Any):
@@ -344,12 +350,31 @@ class RobloxTracker:
             print("----------------------------\n")
 
 
+# --- Dummy Web Server (For Render Health Check) ---
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """A minimal handler that just confirms the service is running."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Tracker worker is running.")
+
+def run_dummy_webserver(host=DUMMY_WEB_SERVER_HOST, port=DUMMY_WEB_SERVER_PORT):
+    """Starts the dummy web server in a separate thread."""
+    server_address = (host, port)
+    # The server will log that it started, which is a good indicator for Render
+    logging.info(f"Starting required dummy web server on http://{host}:{port}")
+    try:
+        httpd = HTTPServer(server_address, HealthCheckHandler)
+        httpd.serve_forever()
+    except Exception as e:
+        logging.error(f"Failed to start dummy web server: {e}")
+
+
 # --- Main Async Runner ---
-async def main():
+async def main_tracker_loop():
     """Initializes the tracker and runs the continuous loop."""
-    # Set logging level to DEBUG to see more details, including the simulation data/flow
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    
     # Initialize the tracker instance
     tracker = RobloxTracker(
         user_id=USER_ID_TO_TRACK, 
@@ -363,12 +388,24 @@ async def main():
         logging.debug(f"Sleeping for {LOGGING_INTERVAL_SECONDS} seconds...")
         await asyncio.sleep(LOGGING_INTERVAL_SECONDS)
 
+async def main():
+    """Sets up logging and runs the tracker and dummy web server concurrently."""
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    # 1. Start the dummy web server in a separate thread (it's blocking)
+    # This is essential to prevent the Render Web Service deployment from hanging
+    server_thread = threading.Thread(target=run_dummy_webserver, daemon=True)
+    server_thread.start()
+    logging.info("Tracker thread started.")
+
+    # 2. Run the main tracking loop as an asynchronous task
+    await main_tracker_loop()
+
+
 if __name__ == '__main__':
-    # You can change SIMULATION_STATE at the top of the file to test transitions:
-    # 1. Set SIMULATION_STATE = "OFFLINE" and run: Should show IDLE logs.
-    # 2. Stop, set SIMULATION_STATE = "PLAYING" and run: Should show START Session log.
-    # 3. Run again: Should show CONTINUE Session logs.
-    # 4. Stop, set SIMULATION_STATE = "OFFLINE" and run: Should show END Session log.
+    # Ensure your Render Web Service environment variables are set:
+    # PORT: 8080 (or any port you prefer)
+    # RENDER_EXTERNAL_HOSTNAME: 0.0.0.0
     try:
         asyncio.run(main())
     except RuntimeError as e:
@@ -378,4 +415,3 @@ if __name__ == '__main__':
             raise
     except KeyboardInterrupt:
         print("\nTracker stopped by user.")
-
