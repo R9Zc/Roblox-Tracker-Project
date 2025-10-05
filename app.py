@@ -8,6 +8,7 @@ from flask import Flask, jsonify, request
 import gspread
 from firebase_admin import initialize_app, firestore, credentials
 import asyncio # New import for asyncio.gather
+import traceback # New import for better error logging
 
 # --- Configuration ---
 # Fetch credentials and configuration from environment variables
@@ -18,28 +19,25 @@ try:
     TIMEZONE_NAME = os.environ.get("TIMEZONE", "America/New_York")
     PORT = int(os.environ.get("PORT", 8080))
     # Cache and Users
-    ROBLOX_CACHE = json.loads(os.environ.get("ROBLOX_CACHE", '{"default": "value"}'))
+    # IMPORTANT: Initialize cache with an empty dictionary if the env var isn't set or is invalid
+    cache_str = os.environ.get("ROBLOX_CACHE", '{}')
+    ROBLOX_CACHE = json.loads(cache_str) if cache_str else {}
 except Exception as e:
     logging.error(f"Configuration Error: Failed to load environment variables or JSON. {e}")
-    # Use placeholder values to allow function definitions to proceed, but expect failure later
     SERVICE_ACCOUNT_INFO = {}
     SHEET_KEY = "dummy_key"
     TIMEZONE_NAME = "UTC"
     PORT = 8080
     ROBLOX_CACHE = {}
 
-# --- Firebase Setup (Assuming Firebase setup is separate or handles internal credentials) ---
-# Initialize Firebase (assuming application default credentials or other method is used)
+# --- Firebase Setup ---
 try:
-    # NOTE: Since we are not providing a custom credential object to initialize_app, 
-    # and ApplicationDefault() is used, this might only work if running in a Google Cloud environment.
-    # We will assume for now that if the user requires Firestore, they have set up the environment 
-    # correctly to find default credentials, or we can simply disable this section if it causes issues.
+    # Use ApplicationDefault credentials for Render if available, otherwise assume no persistence
     firebase_app = initialize_app(credentials.ApplicationDefault())
     db = firestore.client()
 except Exception as e:
     logging.warning(f"Firebase initialization failed: {e}. Firestore access will be disabled.")
-    db = None # Set to None if initialization fails
+    db = None 
 
 # --- Global State and Cache ---
 # Simple in-memory cache for tracking session state
@@ -63,7 +61,7 @@ TARGET_USER_IDS = [
 def get_session_duration(start_time_utc):
     """Calculates the duration in minutes from a UTC start time to the current time."""
     try:
-        start_dt = datetime.fromisoformat(start_time_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
+        start_dt = datetime.fromisoformat(start_time_utc.replace(" UTC", "+00:00")).astimezone(timezone.utc)
         current_dt = datetime.now(timezone.utc)
         duration_seconds = (current_dt - start_dt).total_seconds()
         return round(duration_seconds / 60, 2)
@@ -84,7 +82,7 @@ def update_google_sheet(user_id, session_data):
 
         # Open the spreadsheet by key
         spreadsheet = client.open_by_key(SHEET_KEY)
-        worksheet = spreadsheet.worksheet("Raw_Data") # Assuming the tracking sheet is named 'Raw_Data'
+        worksheet = spreadsheet.worksheet("Raw_Data") 
 
         # Find the row by Session ID (assuming Session ID is in column A)
         session_id = session_data['Session_ID']
@@ -94,7 +92,7 @@ def update_google_sheet(user_id, session_data):
         current_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         duration = get_session_duration(session_data['Start_Time_UTC'])
         
-        # Data to update: End Time (G), Duration (H), End Time Local (J)
+        # Data to update: End Time (G), Duration (H)
         end_time_col = 7
         duration_col = 8
         
@@ -155,18 +153,17 @@ async def check_user_presence(client, user_id):
 
     try:
         response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status() # Raise an exception for bad status codes
+        response.raise_for_status() 
         data = response.json()
 
-        # Presence Status Map: 0=Offline, 1=Online, 2=InGame, 3=InStudio
         presence = data['userPresences'][0]
         
-        is_playing = presence['userPresenceType'] == 2 # InGame
+        is_playing = presence['userPresenceType'] == 2 # 2 = InGame
         game_id = presence.get('universeId', 0) if is_playing else 0
         game_name = presence.get('lastLocation', 'Website / Offline')
         
         if game_name == 'Website / Offline':
-            is_playing = False # Override in case presence type was 1 (Online) but location is generic
+            is_playing = False 
             
         return {
             'Roblox_ID': user_id,
@@ -185,20 +182,23 @@ async def check_user_presence(client, user_id):
 async def run_presence_check():
     """Main asynchronous function to check all users and update sessions."""
     
+    global user_session_cache
+    
+    current_time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
     # 1. Fetch data for all users concurrently
-    # IMPORTANT: The client must be passed to the task to share the connection pool.
-    async with httpx.AsyncClient() as client:
+    # This structure guarantees the tasks are created and awaited correctly within the client's lifecycle.
+    async with httpx.AsyncClient(timeout=20) as client:
         # Create a list of awaitable tasks
         tasks = [check_user_presence(client, uid) for uid in TARGET_USER_IDS]
         
         # Run all tasks concurrently and wait for all results
-        results = await asyncio.gather(*tasks) # CORRECT WAY TO GATHER RESULTS
-
-    current_time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    current_time_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # This is the line that will now correctly return a list of results, fixing the 'NoneType' error.
+        results = await asyncio.gather(*tasks) 
 
     # 2. Process results
-    for result in results: # 'results' is now guaranteed to be an iterable (list)
+    for result in results: 
         if not result:
             continue
             
@@ -206,7 +206,6 @@ async def run_presence_check():
         is_playing_now = result['is_playing']
         cache_key = str(user_id)
         
-        # Check if user was playing in the last check
         was_playing = user_session_cache.get(cache_key, {}).get('Playing', False)
         
         user_name = result['user_name']
@@ -242,26 +241,26 @@ async def run_presence_check():
             
         elif not is_playing_now and was_playing:
             # END Session: User stopped playing (was playing, but isn't now)
-            session_to_end = user_session_cache[cache_key]
+            session_to_end = user_session_cache.get(cache_key, {})
             
-            logging.debug(f"END Session: {user_name} left {session_to_end['Game']}.")
+            if not session_to_end.get('Session_ID'):
+                logging.warning(f"Attempted to end session for {user_name} but Session_ID was missing from cache.")
+            else:
+                logging.debug(f"END Session: {user_name} left {session_to_end.get('Game', 'an unknown game')}.")
 
-            # Update Google Sheet with end time and duration
-            update_google_sheet(user_id, session_to_end)
+                # Update Google Sheet with end time and duration
+                update_google_sheet(user_id, session_to_end)
 
             # Clear cache entry for this session
             user_session_cache[cache_key] = {'Playing': False, 'Game': 'Website / Offline'}
             
         elif is_playing_now and was_playing:
-            # CONTINUE Session: Still playing the same game (or a different one, but we assume continuous session)
-            session_id = user_session_cache[cache_key]['Session_ID']
+            # CONTINUE Session: Still playing 
+            session_id = user_session_cache[cache_key].get('Session_ID', 'N/A')
             logging.debug(f"CONTINUE Session: {user_name} in {user_session_cache[cache_key]['Game']}: ID: {session_id}")
-            
-            # Optional: If the game changed, you might end the old session and start a new one here.
-            # For simplicity, we keep the session running as long as they are 'Playing: True'
 
         else:
-            # IDLE: Still offline/on website (wasn't playing, isn't playing)
+            # IDLE: Still offline/on website
             logging.debug(f"IDLE: {user_name} is offline/on website.")
             user_session_cache[cache_key] = {'Playing': False, 'Game': 'Website / Offline'}
             
@@ -289,16 +288,12 @@ def track_sessions():
     logging.info(f"Received request to /track endpoint.")
     try:
         # Since Flask is synchronous, we run the async code in a synchronous context.
+        # This is where the whole async process starts.
         asyncio.run(run_presence_check())
-        
-        # NOTE: We can now save the ROBLOX_CACHE value back into the environment
-        # for debugging/inspection, though it won't persist across restarts on Render.
-        # os.environ["ROBLOX_CACHE"] = json.dumps(user_session_cache) 
         
         return jsonify({"status": "success", "message": "Tracking completed."}), 200
     except Exception as e:
         # Log the full traceback for better debugging
-        import traceback
         logging.error(f"Tracking run failed: {e}\n{traceback.format_exc()}")
         return jsonify({"status": "error", "message": f"Tracking failed: {e}"}), 500
 
@@ -310,9 +305,7 @@ def index():
 # --- Entry Point ---
 
 if __name__ == '__main__':
-    # When running locally, Flask uses the standard run method
     logging.info(f"Starting Flask app on port {PORT}...")
     app.run(host='0.0.0.0', port=PORT, debug=False)
 else:
-    # When running under Gunicorn, app is the WSGI entry point
     logging.info(f"Flask app initialized for Gunicorn.")
