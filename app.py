@@ -13,8 +13,9 @@ LOGGING_INTERVAL_SECONDS = 60  # Check Roblox presence every minute
 LOCAL_TIMEZONE = pytz.timezone('America/New_York') # Set to the timezone you want for timestamps
 
 # Google Sheets Configuration
-GSPREAD_CREDS_ENV_VAR = "GSPREAD_CREDS_JSON"
-SPREADSHEET_KEY_ENV_VAR = "SPREADSHEET_KEY"
+# FIX: Changed variable name to match the one used in the hosting environment (GOOGLE_CREDENTIALS)
+GSPREAD_CREDS_ENV_VAR = "GOOGLE_CREDENTIALS"
+SPREADSHEET_KEY_ENV_VAR = "SHEET_KEY" # Also updating this to match the image name for consistency
 WORKSHEET_NAME = "Sessions" # The name of the worksheet/tab to write to
 SHEETS_SCOPE = ['https://www.googleapis.com/auth/spreadsheets']
 
@@ -248,6 +249,23 @@ async def fetch_all_users_presence_data() -> List[Dict[str, Any]]:
                 user_data_list.append(result)
                 
     return user_data_list
+
+
+async def _process_single_user_presence(user_id: int, user_name: str, u_presence: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Helper function to parse and package presence data for a single user."""
+    try:
+        is_playing, active_game_id, game_name = await _parse_presence(u_presence)
+        
+        return {
+            'user_id': user_id,
+            'user_name': user_name,
+            'playing': is_playing,
+            'active_game_id': active_game_id,
+            'game_name': game_name
+        }
+    except Exception as e:
+        logging.error(f"Error processing presence for {user_name} ({user_id}): {e}")
+        return None
 
 
 async def execute_tracking():
