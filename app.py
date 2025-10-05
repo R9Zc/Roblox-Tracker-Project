@@ -81,7 +81,9 @@ def init_gspread():
         spreadsheet = gc.open_by_key(sheet_key)
         
         # Select the first worksheet (usually "Sheet1")
-        worksheet = spreadsheet.sheet1
+        # NOTE: The user's sheet is named "Activity Log" in the previous context, but the code uses sheet1.
+        # We will assume sheet1 is the correct, currently active sheet for now.
+        worksheet = spreadsheet.sheet1 
         
         # Define the expected header row
         expected_header = [
@@ -93,10 +95,11 @@ def init_gspread():
         # Check if header exists and update if necessary
         # Note: This is a synchronous gspread call, fine for initialization
         if worksheet.row_count == 0 or worksheet.row_values(1) != expected_header:
-            logging.info("Setting up Sheet header row...")
+            logging.info(f"Setting up Sheet header row for '{worksheet.title}'...")
             worksheet.update([expected_header])
 
-        logging.critical(f"Successfully connected to Google Sheet: {spreadsheet.title}")
+        # Updated log to confirm the worksheet title is active
+        logging.critical(f"Successfully connected to Google Sheet: {spreadsheet.title} (Worksheet: {worksheet.title})")
         gspread_sheet = worksheet # Store globally
         return worksheet
 
@@ -204,9 +207,12 @@ class RobloxTracker:
 
         if gspread_sheet:
             try:
+                # CRITICAL LOGGING ADDED HERE TO CONFIRM WE REACH THE WRITE ATTEMPT
+                logging.critical(f"SHEET WRITE ATTEMPT: Log for {session_log['user_name']} (Duration: {session_log['duration_minutes']:.2f} mins).")
+
                 # Use asyncio.to_thread to run the synchronous gspread operation without blocking
                 await asyncio.to_thread(gspread_sheet.append_row, row_data) 
-                logging.critical(f"Session Logged to Sheet: {session_log['user_name']} played {session_log['duration_minutes']:.2f} mins.")
+                logging.critical(f"Session Logged to Sheet SUCCESS: {session_log['user_name']} played {session_log['duration_minutes']:.2f} mins.")
             except Exception as e:
                 logging.error(f"Failed to write to Google Sheet for {self.user_name}: {e}")
                 
@@ -452,4 +458,3 @@ if __name__ == '__main__':
         asyncio.run(main())
     except Exception as e:
         logging.error(f"Application failed to run: {e}")
-
