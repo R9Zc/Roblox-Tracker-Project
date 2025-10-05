@@ -1,4 +1,6 @@
-Flask
 gunicorn
+Flask
+httpx
 gspread
-requests
+google-auth
+firebase-admin
