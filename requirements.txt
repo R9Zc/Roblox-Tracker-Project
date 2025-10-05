@@ -1,6 +1,3 @@
-gunicorn
-Flask
 httpx
 gspread
-google-auth
-firebase-admin
+pytz
