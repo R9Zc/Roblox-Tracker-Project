@@ -4,9 +4,28 @@ import logging
 import time
 import datetime
 import os
-import pytz
-import gspread
 from typing import Dict, Any, List, Optional, Tuple
+
+# --- Dependency Check & Imports ---
+# These checks ensure the app fails gracefully if any required library is missing.
+try:
+    import pytz
+except ImportError:
+    logging.critical("CRITICAL: Missing 'pytz' library. Please ensure it is in your requirements.txt.")
+    exit(1)
+    
+try:
+    import gspread
+except ImportError:
+    logging.critical("CRITICAL: Missing 'gspread' library. Please ensure it is in your requirements.txt.")
+    exit(1)
+
+try:
+    import httpx
+except ImportError:
+    logging.critical("CRITICAL: Missing 'httpx' library. Please ensure it is in your requirements.txt.")
+    exit(1)
+
 
 # --- Configuration ---
 LOGGING_INTERVAL_SECONDS = 60  # Check Roblox presence every minute
@@ -18,14 +37,6 @@ GSPREAD_CREDS_ENV_VAR = "GOOGLE_CREDENTIALS"
 SPREADSHEET_KEY_ENV_VAR = "SHEET_KEY" # Also updating this to match the image name for consistency
 WORKSHEET_NAME = "Sessions" # The name of the worksheet/tab to write to
 SHEETS_SCOPE = ['https://www.googleapis.com/auth/spreadsheets']
-
-# Dependency check (since we assume dependencies are installed via requirements.txt)
-try:
-    import httpx
-except ImportError:
-    logging.critical("CRITICAL: httpx library not found. Cannot proceed with API calls.")
-    exit(1)
-
 
 # CONSOLIDATED USER LIST
 USERS_TO_TRACK = {
