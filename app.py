@@ -6,11 +6,13 @@ from datetime import datetime, timezone
 import httpx
 from flask import Flask, jsonify, request
 import gspread
-from firebase_admin import initialize_app, firestore, credentials
 import asyncio 
 import traceback 
-# Import modules for explicit timezone handling (if available, relying on system TZ otherwise)
-# from zoneinfo import ZoneInfo # Standard in Python 3.9+
+
+# NEW: Import for robust Google service account credential handling
+from google.oauth2 import service_account 
+
+# Note: Firebase imports and setup have been removed as they are not required for core functionality.
 
 # --- Configuration ---
 # Fetch credentials and configuration from environment variables
@@ -21,7 +23,7 @@ try:
     # Set default local timezone to IST (India Standard Time)
     TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Kolkata") 
     PORT = int(os.environ.get("PORT", 8080))
-    # Cache and Users
+    # Cache and Users - Note: This cache is now purely in-memory for the life of the process.
     cache_str = os.environ.get("ROBLOX_CACHE", '{}')
     ROBLOX_CACHE = json.loads(cache_str) if cache_str else {}
 except Exception as e:
@@ -31,15 +33,6 @@ except Exception as e:
     TIMEZONE_NAME = "UTC"
     PORT = 8080
     ROBLOX_CACHE = {}
-
-# --- Firebase Setup ---
-try:
-    # Use ApplicationDefault credentials for Render if available, otherwise assume no persistence
-    firebase_app = initialize_app(credentials.ApplicationDefault())
-    db = firestore.client()
-except Exception as e:
-    logging.warning(f"Firebase initialization failed: {e}. Firestore access will be disabled.")
-    db = None 
 
 # --- Global State and Cache ---
 # Simple in-memory cache for tracking session state
@@ -81,9 +74,9 @@ def update_google_sheet(user_id, session_data):
         return
 
     try:
-        # Authenticate using the service account key loaded from the environment
-        credentials = gspread.service_account_from_dict(SERVICE_ACCOUNT_INFO)
-        client = gspread.authorize(credentials)
+        # FIX 1: Use google.oauth2.service_account for robust credential creation
+        creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
+        client = gspread.authorize(creds)
 
         # Open the spreadsheet by key
         spreadsheet = client.open_by_key(SHEET_KEY)
@@ -91,14 +84,17 @@ def update_google_sheet(user_id, session_data):
 
         # Find the row by Session ID (assuming Session ID is in column A)
         session_id = session_data['Session_ID']
-        cell = worksheet.find(session_id, in_column=1)
+        
+        try:
+            cell = worksheet.find(session_id, in_column=1)
+        except gspread.CellNotFound: # FIX 2: Corrected exception name
+            logging.error(f"Session ID {session_id} not found in sheet. Cannot end session.")
+            return
 
         # Prepare end time and duration data
         current_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         
         # Calculate local end time using the configured TIMEZONE_NAME
-        # We rely on the system/environment configuration to interpret datetime.now() 
-        # based on the TIMEZONE environment variable set in Render.
         current_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         duration = get_session_duration(session_data['Start_Time_UTC'])
@@ -115,9 +111,8 @@ def update_google_sheet(user_id, session_data):
         
         logging.info(f"Session {session_id} ended. Duration: {duration} mins.")
         
-    except gspread.exceptions.CellNotFound:
-        logging.error(f"Session ID {session_id} not found in sheet. Cannot end session.")
     except Exception as e:
+        # This catches errors during client authorization, sheet opening, and cell updates
         logging.error(f"Failed to update Google Sheet: {e}")
 
 
@@ -128,9 +123,9 @@ def write_new_session_to_sheet(session_data):
         return
 
     try:
-        # Authenticate using the service account key
-        credentials = gspread.service_account_from_dict(SERVICE_ACCOUNT_INFO)
-        client = gspread.authorize(credentials)
+        # FIX 1: Use google.oauth2.service_account for robust credential creation
+        creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
+        client = gspread.authorize(creds)
         
         spreadsheet = client.open_by_key(SHEET_KEY)
         worksheet = spreadsheet.worksheet("Raw_Data")
@@ -154,6 +149,7 @@ def write_new_session_to_sheet(session_data):
         logging.info(f"New session started for {session_data['User_Name']}. Session ID: {session_data['Session_ID']}")
 
     except Exception as e:
+        # This catches errors during client authorization or sheet writing
         logging.error(f"Failed to write new session to Google Sheet: {e}")
 
 # --- Roblox API Logic ---
@@ -178,13 +174,11 @@ async def check_user_presence(client, user_id):
         if game_name == 'Website / Offline':
             is_playing = False 
             
-        # *** NEW ROBUSTNESS CHECK ***
         # If the user is marked 'InGame' but the game_id is 0/null (due to privacy settings or old game), 
         # we treat them as 'not playing' for tracking purposes, as we can't log the session without an ID.
         if is_playing and game_id == 0:
             logging.warning(f"User {user_id} ({presence.get('username', 'Unknown')}) is 'InGame' but game_id is 0/null. Treating as Offline for tracking.")
             is_playing = False
-        # ***************************
 
         return {
             'Roblox_ID': user_id,
@@ -300,17 +294,6 @@ async def run_presence_check():
             user_session_cache[cache_key] = {'Playing': False, 'Game': 'Website / Offline'}
             
         logging.debug(f"Cache Updated: {user_name} -> Playing: {user_session_cache[cache_key]['Playing']}, Game: {user_session_cache[cache_key]['Game']}")
-
-    # 3. Update the persistent cache (Firestore)
-    if db:
-        try:
-            cache_ref = db.collection('app_cache').document('roblox_tracker')
-            # Convert user IDs in cache keys back to strings if necessary for JSON storage
-            storable_cache = {str(k): v for k, v in user_session_cache.items()}
-            cache_ref.set({'cache_data': storable_cache})
-            logging.info("Successfully saved session cache to Firestore.")
-        except Exception as e:
-            logging.error(f"Failed to save session cache to Firestore: {e}")
 
 # --- Flask Routes ---
 
