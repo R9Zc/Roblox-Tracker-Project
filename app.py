@@ -92,9 +92,10 @@ def initialize_gspread():
         spreadsheet = gc.open_by_key(sheet_key)
         
         try:
-            sessions_worksheet = spreadsheet.worksheet('Sessions')
+            # --- FIX: Changed 'Sessions' to 'Activity Log' as requested ---
+            sessions_worksheet = spreadsheet.worksheet('Activity Log')
         except gspread.WorksheetNotFound:
-            logging.critical("FATAL: Worksheet named 'Sessions' not found. Please create it.")
+            logging.critical("FATAL: Worksheet named 'Activity Log' not found. Please create it.")
             return False
             
         logging.info("Google Sheets client initialized successfully.")
@@ -148,7 +149,7 @@ async def log_session_end(session_log: Dict[str, Any]):
     ]
     
     try:
-        # Append the row to the 'Sessions' sheet
+        # Append the row to the 'Activity Log' sheet (Updated comment for clarity)
         sessions_worksheet.append_row(row_data)
         logging.critical(f"Session Logged (Sheet): {session_log['user_name']} played {session_log['duration_minutes']:.2f} mins.")
     except Exception as e:
