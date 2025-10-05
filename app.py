@@ -26,7 +26,7 @@ USERS_TO_TRACK = {
     "jsadujgha": 5120230728,
     "NOTKRZEN": 4491738101,
     "Cyrus_STORM": 3263707365,
-    "TechnoBladeNeverDies": 3206102104, # NEW USER ADDED
+    "TechnoBladeNeverDies": 3206102104, 
 }
 
 ROBLOX_PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
@@ -118,7 +118,6 @@ class RobloxTracker:
 
     async def get_user_tracking_status(self) -> Dict[str, Any]:
         """Retrieves the current tracking status from cache."""
-        # Note: This logic now correctly fetches/initializes status based on the specific user ID
         return self._user_tracking_cache.get(self.user_id, {
             'user_id': self.user_id, 'user_name': self.user_name, 'playing': False,
             'active_game_id': 0, 'game_name': 'N/A', 'session_start': None, 'session_id': None
@@ -155,9 +154,16 @@ class RobloxTracker:
         return place_id, game_name
 
     async def _parse_presence(self, user_presence: Dict[str, Any]) -> Tuple[bool, int, str]:
-        """Parses the raw presence API response into a simplified tracking state."""
+        """
+        Parses the raw presence API response into a simplified tracking state.
+        
+        Updated to handle multiple types of 'active' presence (e.g., InGame, InStudio).
+        """
         user_presence_type = user_presence.get("userPresenceType", 0)
-        is_playing = user_presence_type == 2 # 2 means InGame
+        
+        # userPresenceType: 0=Offline, 1=Online/Website, 2=InGame, 3=InStudio
+        # We consider any type > 1 as 'playing' or 'active'.
+        is_playing = user_presence_type > 1 
         
         # Roblox sometimes uses placeId, rootPlaceId, or universeId
         active_game_id = user_presence.get("placeId") or user_presence.get("rootPlaceId") or user_presence.get("universeId")
@@ -170,11 +176,17 @@ class RobloxTracker:
 
         if not is_playing:
             game_name = "Website / Offline"
+            active_game_id = 0
+        elif user_presence_type == 3: # In Studio
+             game_name = f"Creating in Studio: {game_name}"
         elif active_game_id != 0:
             # If we have a place ID, try to get a more accurate name
             fetched_game_id, fetched_game_name = await self._get_game_details(active_game_id)
             if fetched_game_name not in ["Unknown Game", "Private Server"]:
                 game_name = f"{fetched_game_name} [ID: {active_game_id}]"
+        elif active_game_id == 0 and is_playing:
+             # Case where they are InGame (type 2) but game ID is masked/0 (likely private server or high privacy)
+             game_name = f"In Game (ID Hidden): {game_name}"
         
         return is_playing, active_game_id, game_name
 
@@ -241,26 +253,36 @@ class RobloxTracker:
             u['session_start'], u['session_id'] = None, None
             await self.update_user_tracking_status(u)
             
-        elif cached_tracking and current_tracking and current_game_id != cached_game_id: # SWITCH: Was playing, is in a new game
-            if c['session_start'] is None:
-                logging.warning("No session_start found for a game switch.")
-            else:
-                # Log old session end
-                session_duration = current_time - c['session_start']
-                session_log = {
-                    'user_id': c['user_id'], 'user_name': c['user_name'], 'game_id': cached_game_id,
-                    'game_name': c['game_name'], 'start_time': c['session_start'], 'end_time': current_time,
-                    'duration_seconds': session_duration, 'duration_minutes': session_duration / 60.0,
-                    'session_id': c['session_id']
-                }
-                logging.critical(f"SWITCH Game: {u['user_name']} ended old session. Duration: {session_log['duration_minutes']:.2f} mins.")
-                await self.log_session_end(session_log)
+        elif cached_tracking and current_tracking and current_game_id != cached_game_id: # SWITCH: Was playing, is in a new game (or ID changed)
+            # Only trigger a switch if the ID has actually changed AND it's not both being hidden/0.
+            # If both old and new game IDs are 0, we assume it's a private server continue.
+            is_game_id_change_significant = (current_game_id != 0 or cached_game_id != 0)
             
-            # Start new session
-            u['session_start'] = current_time
-            u['session_id'] = f"SESS_{self.user_id}_{current_time}"
-            logging.critical(f"START Session: {u['user_name']} in NEW game: {u['game_name']}") 
-            await self.update_user_tracking_status(u)
+            if is_game_id_change_significant:
+                if c['session_start'] is None:
+                    logging.warning("No session_start found for a game switch.")
+                else:
+                    # Log old session end
+                    session_duration = current_time - c['session_start']
+                    session_log = {
+                        'user_id': c['user_id'], 'user_name': c['user_name'], 'game_id': cached_game_id,
+                        'game_name': c['game_name'], 'start_time': c['session_start'], 'end_time': current_time,
+                        'duration_seconds': session_duration, 'duration_minutes': session_duration / 60.0,
+                        'session_id': c['session_id']
+                    }
+                    logging.critical(f"SWITCH Game: {u['user_name']} ended old session. Duration: {session_log['duration_minutes']:.2f} mins.")
+                    await self.log_session_end(session_log)
+                
+                # Start new session
+                u['session_start'] = current_time
+                u['session_id'] = f"SESS_{self.user_id}_{current_time}"
+                logging.critical(f"START Session: {u['user_name']} in NEW game: {u['game_name']}") 
+                await self.update_user_tracking_status(u)
+            else:
+                 # If both IDs are 0, it's a continue in a hidden/private game
+                 u['session_start'], u['session_id'] = c['session_start'], c['session_id']
+                 logging.debug(f"CONTINUE Session (Hidden ID): {u['user_name']} in {u['game_name']}")
+                 await self.update_user_tracking_status(u)
             
         else: # CONTINUE / IDLE: Status hasn't changed (still playing same game or still offline)
             if current_tracking:
