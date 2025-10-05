@@ -51,11 +51,13 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 
 # User IDs to track (Replace with your actual list of Roblox user IDs)
 TARGET_USER_IDS = [
-    1992158202, # hulk_buster9402
+    1992158202, # Rushabh
     5120230728, # jsadujgha
-    4491738101, # NOTKRZEN
-    3263707365, # Cyrus_STORM
-    3206102104, # TechnoBladeNeverDies
+    4491738101, # Saish
+    3263707365, # Saumya
+    3206102104, # Shirsh
+    8086548901, # Nikunj
+    6057670047, # Rivan
 ]
 
 # --- Google Sheets Functions ---
@@ -176,6 +178,14 @@ async def check_user_presence(client, user_id):
         if game_name == 'Website / Offline':
             is_playing = False 
             
+        # *** NEW ROBUSTNESS CHECK ***
+        # If the user is marked 'InGame' but the game_id is 0/null (due to privacy settings or old game), 
+        # we treat them as 'not playing' for tracking purposes, as we can't log the session without an ID.
+        if is_playing and game_id == 0:
+            logging.warning(f"User {user_id} ({presence.get('username', 'Unknown')}) is 'InGame' but game_id is 0/null. Treating as Offline for tracking.")
+            is_playing = False
+        # ***************************
+
         return {
             'Roblox_ID': user_id,
             'is_playing': is_playing,
