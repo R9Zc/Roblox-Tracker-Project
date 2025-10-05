@@ -5,8 +5,9 @@ import time
 from datetime import datetime, timezone
 import httpx
 from flask import Flask, jsonify, request
-import gspread # Changed import structure
+import gspread
 from firebase_admin import initialize_app, firestore, credentials
+import asyncio # New import for asyncio.gather
 
 # --- Configuration ---
 # Fetch credentials and configuration from environment variables
@@ -30,6 +31,10 @@ except Exception as e:
 # --- Firebase Setup (Assuming Firebase setup is separate or handles internal credentials) ---
 # Initialize Firebase (assuming application default credentials or other method is used)
 try:
+    # NOTE: Since we are not providing a custom credential object to initialize_app, 
+    # and ApplicationDefault() is used, this might only work if running in a Google Cloud environment.
+    # We will assume for now that if the user requires Firestore, they have set up the environment 
+    # correctly to find default credentials, or we can simply disable this section if it causes issues.
     firebase_app = initialize_app(credentials.ApplicationDefault())
     db = firestore.client()
 except Exception as e:
@@ -74,7 +79,7 @@ def update_google_sheet(user_id, session_data):
 
     try:
         # Authenticate using the service account key loaded from the environment
-        credentials = gspread.service_account_from_dict(SERVICE_ACCOUNT_INFO) # Changed function path
+        credentials = gspread.service_account_from_dict(SERVICE_ACCOUNT_INFO)
         client = gspread.authorize(credentials)
 
         # Open the spreadsheet by key
@@ -92,19 +97,10 @@ def update_google_sheet(user_id, session_data):
         # Data to update: End Time (G), Duration (H), End Time Local (J)
         end_time_col = 7
         duration_col = 8
-        end_time_local_col = 10
         
         # Update cells
         worksheet.update_cell(cell.row, end_time_col, current_utc)
         worksheet.update_cell(cell.row, duration_col, duration)
-        
-        # Calculate and update local time
-        start_dt = datetime.fromisoformat(session_data['Start_Time_UTC'].replace(" UTC", "+00:00"))
-        local_dt = start_dt.astimezone(datetime.now(timezone.utc).tzinfo).replace(tzinfo=None)
-        
-        # NOTE: Since gspread does not automatically handle timezone conversions for the end time,
-        # we will simply log the UTC end time and rely on Google Sheets formulas for local conversion.
-        # However, to be helpful, let's just write the current UTC time.
         
         logging.info(f"Session {session_id} ended. Duration: {duration} mins.")
         
@@ -122,7 +118,7 @@ def write_new_session_to_sheet(session_data):
 
     try:
         # Authenticate using the service account key
-        credentials = gspread.service_account_from_dict(SERVICE_ACCOUNT_INFO) # Changed function path
+        credentials = gspread.service_account_from_dict(SERVICE_ACCOUNT_INFO)
         client = gspread.authorize(credentials)
         
         spreadsheet = client.open_by_key(SHEET_KEY)
@@ -151,55 +147,58 @@ def write_new_session_to_sheet(session_data):
 
 # --- Roblox API Logic ---
 
-async def check_user_presence(user_id):
-    """Fetches presence data for a single Roblox user ID."""
+async def check_user_presence(client, user_id):
+    """Fetches presence data for a single Roblox user ID using the shared client."""
     url = "https://presence.roblox.com/v1/presence/users"
     headers = {'Content-Type': 'application/json'}
     payload = {"userIds": [user_id]}
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status() # Raise an exception for bad status codes
-            data = response.json()
+    try:
+        response = await client.post(url, headers=headers, json=payload)
+        response.raise_for_status() # Raise an exception for bad status codes
+        data = response.json()
 
-            # Presence Status Map: 0=Offline, 1=Online, 2=InGame, 3=InStudio
-            presence = data['userPresences'][0]
+        # Presence Status Map: 0=Offline, 1=Online, 2=InGame, 3=InStudio
+        presence = data['userPresences'][0]
+        
+        is_playing = presence['userPresenceType'] == 2 # InGame
+        game_id = presence.get('universeId', 0) if is_playing else 0
+        game_name = presence.get('lastLocation', 'Website / Offline')
+        
+        if game_name == 'Website / Offline':
+            is_playing = False # Override in case presence type was 1 (Online) but location is generic
             
-            is_playing = presence['userPresenceType'] == 2 # InGame
-            game_id = presence.get('universeId', 0) if is_playing else 0
-            game_name = presence.get('lastLocation', 'Website / Offline')
-            
-            if game_name == 'Website / Offline':
-                is_playing = False # Override in case presence type was 1 (Online) but location is generic
-                
-            return {
-                'Roblox_ID': user_id,
-                'is_playing': is_playing,
-                'game_id': game_id,
-                'game_name': game_name,
-                'user_name': presence.get('username', 'Unknown')
-            }
-        except httpx.HTTPError as e:
-            logging.error(f"HTTP error fetching presence for {user_id}: {e}")
-            return None
-        except Exception as e:
-            logging.error(f"General error fetching presence for {user_id}: {e}")
-            return None
+        return {
+            'Roblox_ID': user_id,
+            'is_playing': is_playing,
+            'game_id': game_id,
+            'game_name': game_name,
+            'user_name': presence.get('username', 'Unknown')
+        }
+    except httpx.HTTPError as e:
+        logging.error(f"HTTP error fetching presence for {user_id}: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"General error fetching presence for {user_id}: {e}")
+        return None
 
 async def run_presence_check():
     """Main asynchronous function to check all users and update sessions."""
     
     # 1. Fetch data for all users concurrently
+    # IMPORTANT: The client must be passed to the task to share the connection pool.
     async with httpx.AsyncClient() as client:
-        tasks = [check_user_presence(uid) for uid in TARGET_USER_IDS]
-        results = await client.aclose() # Ensure client is closed after requests
+        # Create a list of awaitable tasks
+        tasks = [check_user_presence(client, uid) for uid in TARGET_USER_IDS]
+        
+        # Run all tasks concurrently and wait for all results
+        results = await asyncio.gather(*tasks) # CORRECT WAY TO GATHER RESULTS
 
     current_time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     current_time_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 2. Process results
-    for result in results:
+    for result in results: # 'results' is now guaranteed to be an iterable (list)
         if not result:
             continue
             
@@ -268,13 +267,7 @@ async def run_presence_check():
             
         logging.debug(f"Cache Updated: {user_name} -> Playing: {user_session_cache[cache_key]['Playing']}, Game: {user_session_cache[cache_key]['Game']}")
 
-    # 3. Update the persistent cache (environment variable)
-    # This simulates saving state back to the hosting platform's environment variable.
-    # NOTE: Render does not natively support updating environment variables from the running app,
-    # so this is the part that will fail in a true Render environment. 
-    # For a persistent solution, you MUST use a database like Firestore or Redis.
-    # Since we initialized Firestore, we should use it!
-    
+    # 3. Update the persistent cache (Firestore)
     if db:
         try:
             cache_ref = db.collection('app_cache').document('roblox_tracker')
@@ -284,9 +277,6 @@ async def run_presence_check():
             logging.info("Successfully saved session cache to Firestore.")
         except Exception as e:
             logging.error(f"Failed to save session cache to Firestore: {e}")
-            
-    # As a fallback (for non-firestore environments)
-    # os.environ["ROBLOX_CACHE"] = json.dumps(user_session_cache) # This line will not work on Render
 
 # --- Flask Routes ---
 
@@ -299,11 +289,17 @@ def track_sessions():
     logging.info(f"Received request to /track endpoint.")
     try:
         # Since Flask is synchronous, we run the async code in a synchronous context.
-        import asyncio
         asyncio.run(run_presence_check())
+        
+        # NOTE: We can now save the ROBLOX_CACHE value back into the environment
+        # for debugging/inspection, though it won't persist across restarts on Render.
+        # os.environ["ROBLOX_CACHE"] = json.dumps(user_session_cache) 
+        
         return jsonify({"status": "success", "message": "Tracking completed."}), 200
     except Exception as e:
-        logging.error(f"Tracking run failed: {e}")
+        # Log the full traceback for better debugging
+        import traceback
+        logging.error(f"Tracking run failed: {e}\n{traceback.format_exc()}")
         return jsonify({"status": "error", "message": f"Tracking failed: {e}"}), 500
 
 @app.route('/')
