@@ -1,321 +1,495 @@
-import os
+import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
-import httpx
-from flask import Flask, jsonify, request
-import gspread
-import asyncio 
-import traceback 
-from google.oauth2 import service_account 
+import datetime
+import pytz # For timezone handling
+from typing import Dict, Any, Optional, Tuple, List
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import os 
+import sys
+
+# Import httpx for real async API requests
+try:
+    import httpx
+    IS_SIMULATION_MODE = False
+except ImportError:
+    IS_SIMULATION_MODE = True
+    print("WARNING: 'httpx' not found. Running in SIMULATION MODE. No real API calls will be made.")
+
+# Import gspread for Google Sheets integration
+gspread_sheet = None # Global variable to hold the open worksheet
+try:
+    # Attempt to import gspread and pytz (as specified in requirements.txt)
+    import gspread 
+    import pytz 
+    IS_GSPREAD_AVAILABLE = True
+except ImportError:
+    IS_GSPREAD_AVAILABLE = False
+    print("WARNING: 'gspread' or 'pytz' not found. Session logging will be in-memory only.")
 
 # --- Configuration ---
-# Fetch credentials and configuration from environment variables
-try:
-    # Use environment variable for service account credentials
-    SERVICE_ACCOUNT_INFO = json.loads(os.environ.get("GOOGLE_CREDENTIALS"))
-    SHEET_KEY = os.environ.get("SHEET_KEY")
-    # Set default local timezone to IST (India Standard Time)
-    TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Kolkata") 
-    PORT = int(os.environ.get("PORT", 8080))
-    # Cache and Users - Note: This cache is now purely in-memory for the life of the process.
-    cache_str = os.environ.get("ROBLOX_CACHE", '{}')
-    ROBLOX_CACHE = json.loads(cache_str) if cache_str else {}
-except Exception as e:
-    logging.error(f"Configuration Error: Failed to load environment variables or JSON. {e}")
-    SERVICE_ACCOUNT_INFO = {}
-    SHEET_KEY = "dummy_key"
-    TIMEZONE_NAME = "UTC"
-    PORT = 8080
-    ROBLOX_CACHE = {}
+LOGGING_INTERVAL_SECONDS = 60 
 
-# --- Global State and Cache ---
-# Simple in-memory cache for tracking session state
-user_session_cache = ROBLOX_CACHE
-app = Flask(__name__)
+# CONFIRMED USERS AND IDS (5 ACCOUNTS)
+USERS_TO_TRACK = {
+    "hulk_buster9402": 1992158202,
+    "jsadujgha": 5120230728,
+    "NOTKRZEN": 4491738101,
+    "Cyrus_STORM": 3263707365,
+    "TechnoBladeNeverDies": 3206102104, 
+}
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+ROBLOX_PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
+ROBLOX_GAME_DETAIL_URL = "https://games.roblox.com/v1/games/multiget-place-details"
 
-# User IDs to track (Replace with your actual list of Roblox user IDs)
-TARGET_USER_IDS = [
-    1992158202, # Rushabh
-    5120230728, # jsadujgha
-    4491738101, # Saish
-    3263707365, # Saumya
-    3206102104, # Shirsh
-    8086548901, # Nikunj
-    6057670047, # Rivan
-]
+# --- Web Server Configuration for Render Health Check ---
+DUMMY_WEB_SERVER_PORT = int(os.environ.get('PORT', 8080))
+DUMMY_WEB_SERVER_HOST = '0.0.0.0'
 
-# --- Google Sheets Functions ---
+# --- Cache and Store ---
+user_tracking_cache: Dict[int, Dict[str, Any]] = {}
+db_store: Dict[str, list] = {'sessions': []} # In-memory store for fallback/console logging
 
-def get_session_duration(start_time_utc):
-    """Calculates the duration in minutes from a UTC start time to the current time."""
-    try:
-        # Ensure the start time string is correctly parsed as UTC
-        start_dt = datetime.fromisoformat(start_time_utc.replace(" UTC", "+00:00")).astimezone(timezone.utc)
-        current_dt = datetime.now(timezone.utc)
-        duration_seconds = (current_dt - start_dt).total_seconds()
-        return round(duration_seconds / 60, 2)
-    except Exception as e:
-        logging.error(f"Error calculating duration: {e}")
-        return 0.0
+# --- Google Sheets Integration ---
 
-def update_google_sheet(user_id, session_data):
-    """Updates the Google Sheet with session data (end time and duration)."""
-    if not SHEET_KEY:
-        logging.error("SHEET_KEY is not set. Cannot update sheet.")
-        return
+# ADDED: Define the correct OAuth scope for Google Sheets API access
+SHEETS_SCOPE = ['https://www.googleapis.com/auth/spreadsheets']
+
+def init_gspread():
+    """Initializes and returns the Google Sheet Worksheet object."""
+    global gspread_sheet
+    
+    if not IS_GSPREAD_AVAILABLE:
+        logging.warning("Gspread is not available. Skipping Sheet initialization.")
+        return None
 
     try:
-        # Use google.oauth2.service_account for robust credential creation
-        creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
-        client = gspread.authorize(creds)
+        # Get necessary credentials from environment variables
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS") 
+        sheet_key = os.environ.get("SHEET_KEY")
+        
+        if not creds_json or not sheet_key:
+            logging.error("Missing GOOGLE_CREDENTIALS or SHEET_KEY environment variables. Sheet logging disabled.")
+            return None
 
-        # Open the spreadsheet by key
-        spreadsheet = client.open_by_key(SHEET_KEY)
-        worksheet = spreadsheet.worksheet("Raw_Data") 
-
-        # Find the row by Session ID (assuming Session ID is in column A)
-        session_id = session_data['Session_ID']
+        # Authenticate using the service account JSON
+        credentials = json.loads(creds_json)
         
-        try:
-            # Corrected exception name: gspread.CellNotFound
-            cell = worksheet.find(session_id, in_column=1)
-        except gspread.CellNotFound: 
-            logging.error(f"Session ID {session_id} not found in sheet. Cannot end session.")
-            return
-
-        # Prepare end time and duration data
-        current_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        # --- CRITICAL FIX: Explicitly pass the SHEETS_SCOPE here ---
+        # This resolves the 'invalid_scope' error
+        gc = gspread.service_account_from_dict(
+            credentials,
+            scopes=SHEETS_SCOPE 
+        )
+        # ----------------------------------------------------------
         
-        # Calculate local end time using the configured TIMEZONE_NAME
-        current_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        duration = get_session_duration(session_data['Start_Time_UTC'])
+        # Open the sheet by key/ID
+        spreadsheet = gc.open_by_key(sheet_key)
         
-        # Data to update: End Time (G), Duration (H), End Time Local (J)
-        end_time_utc_col = 7
-        duration_col = 8
-        end_time_local_col = 10
+        # Select the first worksheet (usually "Sheet1").
+        worksheet = spreadsheet.sheet1 
         
-        # Update cells
-        worksheet.update_cell(cell.row, end_time_utc_col, current_utc)
-        worksheet.update_cell(cell.row, duration_col, duration)
-        worksheet.update_cell(cell.row, end_time_local_col, current_local)
-        
-        logging.info(f"Session {session_id} ended. Duration: {duration} mins.")
-        
-    except Exception as e:
-        # This catches errors during client authorization, sheet opening, and cell updates
-        logging.error(f"Failed to update Google Sheet: {e}")
-
-
-def write_new_session_to_sheet(session_data):
-    """Writes a new active session row to the Google Sheet."""
-    if not SHEET_KEY:
-        logging.error("SHEET_KEY is not set. Cannot write new session.")
-        return
-
-    try:
-        # Use google.oauth2.service_account for robust credential creation
-        creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
-        client = gspread.authorize(creds)
-        
-        spreadsheet = client.open_by_key(SHEET_KEY)
-        worksheet = spreadsheet.worksheet("Raw_Data")
-        
-        # Format the data for insertion
-        row = [
-            session_data['Session_ID'],
-            session_data['User_Name'],
-            session_data['Roblox_ID'],
-            session_data['Game_Name'],
-            session_data['Game_ID'],
-            session_data['Start_Time_UTC'],
-            '', # End Time UTC (G) - Left blank until session ends
-            '', # Duration (H) - Left blank until session ends
-            session_data['Start_Time_Local'],
-            ''  # End Time Local (J) - Left blank until session ends
+        # Define the expected header row
+        expected_header = [
+            "Session ID", "User Name", "Roblox ID", "Game Name", "Game ID",
+            "Start Time (UTC)", "End Time (UTC)", "Duration (Minutes)", 
+            "Start Time (Local)", "End Time (Local)"
         ]
         
-        # Append the new row
-        worksheet.append_row(row, value_input_option='USER_ENTERED')
-        logging.info(f"New session started for {session_data['User_Name']}. Session ID: {session_data['Session_ID']}")
-
-    except Exception as e:
-        # This catches errors during client authorization or sheet writing
-        logging.error(f"Failed to write new session to Google Sheet: {e}")
-
-# --- Roblox API Logic ---
-
-async def check_user_presence(client, user_id):
-    """Fetches presence data for a single Roblox user ID using the shared client."""
-    url = "https://presence.roblox.com/v1/presence/users"
-    headers = {'Content-Type': 'application/json'}
-    payload = {"userIds": [user_id]}
-
-    try:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status() 
-        data = response.json()
-
-        presence = data['userPresences'][0]
-        
-        is_playing = presence['userPresenceType'] == 2 # 2 = InGame
-        game_id = presence.get('universeId', 0) if is_playing else 0
-        game_name = presence.get('lastLocation', 'Website / Offline')
-        user_name = presence.get('username', 'Unknown')
-        
-        if game_name == 'Website / Offline':
-            is_playing = False 
-            
-        # Defensive Fix: If user is playing but game name is empty, use a placeholder.
-        if is_playing and not game_name.strip():
-            game_name = "Unknown Game (Tracking Active)"
-            
-        # If the user is marked 'InGame' but the game_id is 0/null (due to privacy settings or old game), 
-        # we treat them as 'not playing' for tracking purposes, as we can't log the session without an ID.
-        if is_playing and game_id == 0:
-            logging.warning(f"User {user_name} ({user_id}) is 'InGame' but game_id is 0/null. Treating as Offline for tracking.")
-            is_playing = False
-
-        return {
-            'Roblox_ID': user_id,
-            'is_playing': is_playing,
-            'game_id': game_id,
-            'game_name': game_name,
-            'user_name': user_name
-        }
-    except httpx.HTTPError as e:
-        logging.error(f"HTTP error fetching presence for {user_id}: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"General error fetching presence for {user_id}: {e}")
-        return None
-
-async def run_presence_check():
-    """Main asynchronous function to check all users and update sessions."""
-    
-    global user_session_cache
-    
-    current_time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    current_time_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
-    
-    # 1. Fetch data for all users concurrently
-    results = [] 
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            tasks = [check_user_presence(client, uid) for uid in TARGET_USER_IDS]
-            results = await asyncio.gather(*tasks) 
-    except Exception as e:
-        logging.error(f"Async data fetch failed entirely: {e}")
-        
-    if results is None: 
-        results = []
-
-    # 2. Process results
-    for result in results: 
-        if not result:
-            continue
-            
-        user_id = result['Roblox_ID']
-        is_playing_now = result['is_playing']
-        cache_key = str(user_id)
-        
-        was_playing = user_session_cache.get(cache_key, {}).get('Playing', False)
-        
-        # Log a descriptive name (ID if name is 'Unknown')
-        user_display_name = result['user_name'] if result['user_name'] != 'Unknown' else f"User {user_id}"
-        logging.debug(f"Checking presence for {user_display_name}...")
-
-        # --- Transition Logic ---
-
-        if is_playing_now and not was_playing:
-            # START Session: User just started playing
-            session_id = f"SESS_{int(time.time())}_{user_id}"
-            game_name = result['game_name']
-            
-            new_session_data = {
-                'Session_ID': session_id,
-                'User_Name': result['user_name'],
-                'Roblox_ID': user_id,
-                'Game_Name': game_name,
-                'Game_ID': result['game_id'],
-                'Start_Time_UTC': current_time_utc,
-                'Start_Time_Local': current_time_local,
-            }
-            
-            # Update cache
-            user_session_cache[cache_key] = {
-                'Playing': True, 
-                'Game': game_name,
-                'Session_ID': session_id,
-                'Start_Time_UTC': current_time_utc
-            }
-            logging.info(f"START Session: {result['user_name']} in {game_name}. ID: {session_id}")
-
-            # Write to Google Sheet
-            write_new_session_to_sheet(new_session_data)
-            
-        elif not is_playing_now and was_playing:
-            # END Session: User stopped playing (was playing, but isn't now)
-            session_to_end = user_session_cache.get(cache_key, {})
-            
-            if not session_to_end.get('Session_ID'):
-                logging.warning(f"Attempted to end session for {user_display_name} but Session_ID was missing from cache.")
+        # Check if header exists and update if necessary
+        try:
+            current_header = worksheet.row_values(1)
+            if current_header != expected_header:
+                logging.info(f"Setting up Sheet header row for '{worksheet.title}'...")
+                worksheet.update([expected_header])
             else:
-                logging.debug(f"END Session: {user_display_name} left {session_to_end.get('Game', 'an unknown game')}.")
-
-                # Update Google Sheet with end time and duration
-                update_google_sheet(user_id, session_to_end)
-
-            # Clear cache entry for this session
-            user_session_cache[cache_key] = {'Playing': False, 'Game': 'Website / Offline'}
+                logging.info("Sheet header is correctly set.")
+        except Exception as e:
+            logging.error(f"Error checking/updating sheet header: {e}")
             
-        elif is_playing_now and was_playing:
-            # CONTINUE Session: Still playing 
-            session_id = user_session_cache[cache_key].get('Session_ID', 'N/A')
-            game_name = user_session_cache[cache_key]['Game']
-            logging.debug(f"CONTINUE Session: {user_display_name} in {game_name}: ID: {session_id}")
+        # Updated log to confirm the worksheet title is active
+        logging.critical(f"Successfully connected to Google Sheet: {spreadsheet.title} (Worksheet: {worksheet.title})")
+        gspread_sheet = worksheet # Store globally
+        return worksheet
 
-        else:
-            # IDLE: Still offline/on website
-            logging.debug(f"IDLE: {user_display_name} is offline/on website.")
-            user_session_cache[cache_key] = {'Playing': False, 'Game': 'Website / Offline'}
-            
-        logging.debug(f"Cache Updated: {user_display_name} -> Playing: {user_session_cache[cache_key]['Playing']}, Game: {user_session_cache[cache_key]['Game']}")
-
-# --- Flask Routes ---
-
-@app.route('/track')
-def track_sessions():
-    """
-    The main endpoint triggered by the Cron Job.
-    Runs the asynchronous presence check.
-    """
-    logging.info(f"Received request to /track endpoint.")
-    try:
-        # Since Flask is synchronous, we run the async code in a synchronous context.
-        asyncio.run(run_presence_check())
-        
-        return jsonify({"status": "success", "message": "Tracking completed."}), 200
     except Exception as e:
-        # Log the full traceback for better debugging
-        logging.error(f"Tracking run failed: {e}\n{traceback.format_exc()}")
-        return jsonify({"status": "error", "message": f"Tracking failed: {e}"}), 500
+        # CRITICAL: This will log authentication or sheet access failure.
+        logging.error(f"FATAL ERROR: Failed to initialize Google Sheet or authenticate service account: {e}")
+        return None
 
-@app.route('/')
-def index():
-    """Simple status page."""
-    return f"Roblox Tracker Project is running. Trigger tracking via the /track endpoint. Current Timezone: {TIMEZONE_NAME}"
 
-# --- Entry Point ---
+# --- API Call Implementation (Real or Simulated) ---
+async def fetch_api_data(url: str, method: str = 'POST', data: Optional[Dict] = None) -> Optional[Dict]:
+    """Handles both real and simulated API calls."""
+    
+    if IS_SIMULATION_MODE:
+        # --- SIMULATION LOGIC ---
+        await asyncio.sleep(0.5)
+        # In a real environment, the response for a user with privacy issues might look like this:
+        if url == ROBLOX_PRESENCE_URL:
+            if data and data.get('userIds'):
+                user_id = data['userIds'][0]
+                if user_id == USERS_TO_TRACK["hulk_buster9402"]:
+                    raw_data = {
+                        "userPresences": [
+                            {
+                                "userPresenceType": 2, # 2 means InGame
+                                "lastLocation": "A Private Experience",
+                                "placeId": None,
+                                "rootPlaceId": None,
+                                "gameId": None,
+                                "universeId": None,
+                                "userId": user_id,
+                                "lastOnline": f"{time.time()}"
+                            }
+                        ]
+                    }
+                    return raw_data
+            return {"userPresences": []}
+        
+        return None
+        # --- END SIMULATION LOGIC ---
+
+    # --- REAL API LOGIC ---
+    try:
+        async with httpx.AsyncClient() as client:
+            headers = {'Content-Type': 'application/json'}
+            if method == 'POST':
+                response = await client.post(url, headers=headers, json=data, timeout=10.0)
+            elif method == 'GET':
+                 response = await client.get(url, headers=headers, timeout=10.0)
+            else:
+                logging.error(f"Unsupported HTTP method: {method}")
+                return None
+            
+            response.raise_for_status() 
+            return response.json()
+            
+    except httpx.HTTPStatusError as e:
+        logging.error(f"HTTP Error {e.response.status_code} on {url}: {e}")
+    except httpx.RequestError as e:
+        logging.error(f"Request Error on {url}: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error during API call to {url}: {e}")
+        
+    return None
+
+# --- Tracker Class ---
+class RobloxTracker:
+    """Encapsulates the logic and state for tracking a single Roblox user."""
+    def __init__(self, user_id: int, user_name: str, db_client: Any):
+        self.user_id = user_id
+        self.user_name = user_name
+        self.db = db_client # Placeholder (not used for Firestore)
+        
+        # Use the global cache/store for all trackers to share
+        self._user_tracking_cache = user_tracking_cache
+        self._db_store = db_store
+
+
+    async def get_user_tracking_status(self) -> Dict[str, Any]:
+        """Retrieves the current tracking status from cache."""
+        return self._user_tracking_cache.get(self.user_id, {
+            'user_id': self.user_id, 'user_name': self.user_name, 'playing': False,
+            'active_game_id': 0, 'game_name': 'N/A', 'session_start': None, 'session_id': None
+        })
+
+    async def update_user_tracking_status(self, status: Dict[str, Any]):
+        """Updates the current tracking status in cache."""
+        self._user_tracking_cache[self.user_id] = status
+        logging.debug(f"Cache Updated: {self.user_name} -> Playing: {status['playing']}, Game: {status['game_name']}")
+
+
+    async def log_session_end(self, session_log: Dict[str, Any]):
+        """Logs a completed session to Google Sheet (if available) and in-memory store."""
+        
+        # Get the configured local timezone, default to UTC if not set
+        timezone_str = os.environ.get("TIMEZONE", "UTC") 
+        try:
+            local_tz = pytz.timezone(timezone_str)
+        except (pytz.exceptions.UnknownTimeZoneError, NameError):
+            local_tz = pytz.utc
+            logging.warning(f"TIMEZONE not properly set or pytz missing. Defaulting to UTC.")
+            
+        # Convert Unix timestamps to UTC datetime objects
+        start_dt_utc = datetime.datetime.fromtimestamp(session_log['start_time'], tz=pytz.utc)
+        end_dt_utc = datetime.datetime.fromtimestamp(session_log['end_time'], tz=pytz.utc)
+
+        # Convert to local timezone
+        start_dt_local = start_dt_utc.astimezone(local_tz)
+        end_dt_local = end_dt_utc.astimezone(local_tz)
+        
+        # Data row for the Sheet
+        row_data = [
+            session_log['session_id'],
+            session_log['user_name'],
+            str(session_log['user_id']), # Ensure IDs are strings for gspread
+            session_log['game_name'],
+            str(session_log['game_id']), # Ensure IDs are strings for gspread
+            start_dt_utc.strftime('%Y-%m-%d %H:%M:%S %Z'),
+            end_dt_utc.strftime('%Y-%m-%d %H:%M:%S %Z'),
+            f"{session_log['duration_minutes']:.2f}",
+            start_dt_local.strftime('%Y-%m-%d %H:%M:%S %Z'),
+            end_dt_local.strftime('%Y-%m-%d %H:%M:%S %Z'),
+        ]
+
+        if gspread_sheet:
+            try:
+                # CRITICAL LOGGING ADDED HERE TO CONFIRM WE REACH THE WRITE ATTEMPT
+                logging.critical(f"SHEET WRITE ATTEMPT: Log for {session_log['user_name']} (Duration: {session_log['duration_minutes']:.2f} mins). Data: {row_data}")
+
+                # Use asyncio.to_thread to run the synchronous gspread operation without blocking
+                await asyncio.to_thread(gspread_sheet.append_row, row_data) 
+                logging.critical(f"Session Logged to Sheet SUCCESS: {session_log['user_name']} played {session_log['duration_minutes']:.2f} mins.")
+            except Exception as e:
+                # --- ENHANCED ERROR LOGGING ---
+                logging.error("-" * 50)
+                logging.error(f"CRITICAL WRITE FAILURE: Failed to write to Google Sheet for {self.user_name}.")
+                logging.error(f"Error Type: {type(e).__name__}")
+                logging.error(f"Error Message: {e}")
+                logging.error(f"Data Attempted: {row_data}")
+                logging.error("-" * 50)
+                
+        # Log to in-memory store for console output (Always done)
+        self._db_store['sessions'].append(session_log)
+        logging.critical(f"Session Logged: {session_log['user_name']} played {session_log['game_name']} for {session_log['duration_minutes']:.2f} mins.")
+
+    # --- Presence & Game Logic ---
+    async def _get_game_details(self, place_id: int) -> Tuple[int, str]:
+        """Fetches game name for a given Place ID from the Roblox API."""
+        game_name = "Unknown Game"
+        if place_id != 0:
+            try:
+                # Use GET method for place details as per Roblox API documentation
+                response = await fetch_api_data(
+                    ROBLOX_GAME_DETAIL_URL, method='GET', data={'placeIds': [place_id]}
+                )
+                if response and isinstance(response, list) and response[0] and response[0].get('name'):
+                    game_name = response[0]['name']
+            except Exception as e:
+                logging.warning(f"Could not fetch game name for ID {place_id}. Error: {e}")
+        return place_id, game_name
+
+
+    async def _parse_presence(self, user_presence: Dict[str, Any]) -> Tuple[bool, int, str]:
+        """
+        Parses the raw presence API response into a simplified tracking state.
+        
+        Uses type > 1 (InGame, InStudio) to handle hidden/private server status.
+        """
+        user_presence_type = user_presence.get("userPresenceType", 0)
+        
+        # userPresenceType: 0=Offline, 1=Online/Website, 2=InGame, 3=InStudio
+        # We consider any type > 1 as 'playing' or 'active'.
+        is_playing = user_presence_type > 1 
+        
+        active_game_id = user_presence.get("placeId") or user_presence.get("rootPlaceId") or user_presence.get("universeId")
+        try:
+            active_game_id = int(active_game_id or 0)
+        except (TypeError, ValueError):
+            active_game_id = 0
+            
+        game_name = user_presence.get("lastLocation", "N/A")
+
+        if not is_playing:
+            game_name = "Website / Offline"
+            active_game_id = 0
+        elif user_presence_type == 3: # In Studio
+             game_name = f"Creating in Studio: {game_name}"
+        elif active_game_id != 0:
+            # If we have a place ID, try to get a more accurate name
+            fetched_game_id, fetched_game_name = await self._get_game_details(active_game_id)
+            if fetched_game_name not in ["Unknown Game", "Private Server"]:
+                game_name = f"{fetched_game_name} [ID: {active_game_id}]"
+        elif active_game_id == 0 and is_playing:
+             # Case where they are InGame (type 2) but game ID is masked/0 (likely private server or high privacy)
+             game_name = f"In Game (ID Hidden): {game_name}"
+        
+        return is_playing, active_game_id, game_name
+
+    async def fetch_current_presence_data(self) -> Optional[Dict[str, Any]]:
+        """Fetches the current presence data for the tracked user from the API."""
+        
+        payload = {"userIds": list(USERS_TO_TRACK.values())} 
+        
+        response = await fetch_api_data(ROBLOX_PRESENCE_URL, data=payload)
+        
+        if response and response.get('userPresences'):
+            user_presence = next(
+                (u for u in response['userPresences'] if u.get('userId') == self.user_id),
+                None
+            )
+            
+            if user_presence:
+                is_playing, active_game_id, game_name = await self._parse_presence(user_presence)
+                return {
+                    'user_id': self.user_id, 'user_name': self.user_name, 'playing': is_playing,
+                    'active_game_id': active_game_id, 'game_name': game_name
+                }
+        return None
+
+    # --- Main Tracking Loop Logic ---
+    async def execute_tracking(self):
+        """The core logic to check status and manage sessions for a SINGLE user."""
+        logging.info(f"Checking presence for {self.user_name} ({self.user_id})...")
+        
+        current_state = await self.fetch_current_presence_data()
+        cached_state = await self.get_user_tracking_status()
+
+        if not current_state:
+            logging.warning(f"API call failed for {self.user_name}. Skipping this interval.")
+            return
+
+        u = current_state
+        c = cached_state
+        current_time = int(time.time())
+        cached_tracking, current_tracking = c['playing'], u['playing']
+        current_game_id, cached_game_id = u['active_game_id'], c['active_game_id']
+        
+        
+        if not cached_tracking and current_tracking: # START: Was offline, is now playing
+            u['session_start'] = current_time
+            u['session_id'] = f"SESS_{self.user_id}_{current_time}"
+            logging.critical(f"START Session: {u['user_name']} in game: {u['game_name']}") 
+            await self.update_user_tracking_status(u)
+            
+        elif cached_tracking and not current_tracking: # END: Was playing, is now offline
+            if c['session_start'] is None:
+                logging.warning("No session_start found for an ending session.")
+            else:
+                session_duration = current_time - c['session_start']
+                session_log = {
+                    'user_id': c['user_id'], 'user_name': c['user_name'], 'game_id': cached_game_id,
+                    'game_name': c['game_name'], 'start_time': c['session_start'], 'end_time': current_time,
+                    'duration_seconds': session_duration, 'duration_minutes': session_duration / 60.0,
+                    'session_id': c['session_id']
+                }
+                logging.critical(f"END Session: {u['user_name']} left. Duration: {session_log['duration_minutes']:.2f} mins.")
+                await self.log_session_end(session_log)
+            u['session_start'], u['session_id'] = None, None
+            await self.update_user_tracking_status(u)
+            
+        elif cached_tracking and current_tracking and current_game_id != cached_game_id: # SWITCH: Was playing, is in a new game (or ID changed)
+            is_game_id_change_significant = (current_game_id != 0 or cached_game_id != 0)
+            
+            if is_game_id_change_significant:
+                if c['session_start'] is None:
+                    logging.warning("No session_start found for a game switch.")
+                else:
+                    # Log old session end
+                    session_duration = current_time - c['session_start']
+                    session_log = {
+                        'user_id': c['user_id'], 'user_name': c['user_name'], 'game_id': cached_game_id,
+                        'game_name': c['game_name'], 'start_time': c['session_start'], 'end_time': current_time,
+                        'duration_seconds': session_duration, 'duration_minutes': session_duration / 60.0,
+                        'session_id': c['session_id']
+                    }
+                    logging.critical(f"SWITCH Game: {u['user_name']} ended old session. Duration: {session_log['duration_minutes']:.2f} mins.")
+                    await self.log_session_end(session_log)
+                
+                # Start new session
+                u['session_start'] = current_time
+                u['session_id'] = f"SESS_{self.user_id}_{current_time}"
+                logging.critical(f"START Session: {u['user_name']} in NEW game: {u['game_name']}") 
+                await self.update_user_tracking_status(u)
+            else:
+                 # If both IDs are 0, it's a continue in a hidden/private game
+                 u['session_start'], u['session_id'] = c['session_start'], c['session_id']
+                 logging.debug(f"CONTINUE Session (Hidden ID): {u['user_name']} in {u['game_name']}")
+                 await self.update_user_tracking_status(u)
+            
+        else: # CONTINUE / IDLE: Status hasn't changed (still playing same game or still offline)
+            if current_tracking:
+                u['session_start'], u['session_id'] = c['session_start'], c['session_id']
+                logging.debug(f"CONTINUE Session: {u['user_name']} in {u['game_name']}")
+            else:
+                logging.debug(f"IDLE: {u['user_name']} is offline/on website.")
+                
+            await self.update_user_tracking_status(u)
+        
+        # Print the aggregated session log (for in-memory store only)
+        if not IS_GSPREAD_AVAILABLE and self.user_id == list(USERS_TO_TRACK.values())[0] and db_store.get('sessions'):
+            print("\n--- SIMULATED SESSIONS LOG ---")
+            for session in db_store['sessions']:
+                start_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session['start_time']))
+                end_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session['end_time']))
+                print(f"[{session['user_name']}] Played '{session['game_name']}' from {start_time_str} to {end_time_str} ({session['duration_minutes']:.2f} mins).")
+            print("----------------------------\n")
+
+
+# --- Dummy Web Server (For Render Health Check) ---
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """A minimal handler that just confirms the service is running."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Tracker worker is running and port is open.")
+
+def run_dummy_webserver(host=DUMMY_WEB_SERVER_HOST, port=DUMMY_WEB_SERVER_PORT):
+    """Starts the dummy web server in a separate thread."""
+    server_address = (host, port)
+    
+    print(f"--- RENDER SERVICE STARTUP: Attempting to open port {port} on {host} ---")
+    
+    try:
+        httpd = HTTPServer(server_address, HealthCheckHandler)
+        logging.critical(f"SUCCESS: Dummy web server is now serving on http://{host}:{port}")
+        httpd.serve_forever()
+    except Exception as e:
+        logging.error(f"FATAL ERROR: Failed to start dummy web server on port {port}. Error: {e}")
+
+
+# --- Main Async Runner ---
+async def main_tracker_loop():
+    """Initializes the tracker for each user and runs the continuous loop."""
+    
+    # NEW STEP: Initialize GSpread before starting the loop
+    if IS_GSPREAD_AVAILABLE:
+        init_gspread()
+        
+    # Create a list of tracker instances, one for each user
+    trackers: List[RobloxTracker] = []
+    
+    for user_name, user_id in USERS_TO_TRACK.items():
+        if isinstance(user_id, int) and user_id > 0:
+            trackers.append(RobloxTracker(user_id=user_id, user_name=user_name, db_client=None))
+        else:
+             logging.error(f"Skipping user '{user_name}'. ID is missing or invalid: {user_id}")
+    
+    if not trackers:
+        logging.critical("ERROR: No valid user IDs found in USERS_TO_TRACK. Shutting down loop.")
+        return 
+
+    # Run the tracking loop
+    while True:
+        await asyncio.gather(*[tracker.execute_tracking() for tracker in trackers])
+        await asyncio.sleep(LOGGING_INTERVAL_SECONDS)
+
+async def main():
+    """Sets up logging and runs the tracker and dummy web server concurrently."""
+    # Set to DEBUG to see all cache updates, or INFO to see only session START/END
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    # 1. Start the dummy web server
+    server_thread = threading.Thread(target=run_dummy_webserver, daemon=True)
+    server_thread.start()
+    
+    # 2. Run the main tracking loop
+    await main_tracker_loop()
+
 
 if __name__ == '__main__':
-    logging.info(f"Starting Flask app on port {PORT}...")
-    app.run(host='0.0.0.0', port=PORT, debug=False)
-else:
-    logging.info(f"Flask app initialized for Gunicorn.")
+    if IS_SIMULATION_MODE:
+        print("\n=======================================================")
+        print("!!! WARNING: 'httpx' is missing. Tracker will not make real API calls. !!!")
+        print("!!! Please ensure 'httpx' is in your requirements.txt. !!!")
+        print("=======================================================\n")
+        
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logging.error(f"Application failed to run: {e}")
