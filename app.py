@@ -8,11 +8,7 @@ from flask import Flask, jsonify, request
 import gspread
 import asyncio 
 import traceback 
-
-# NEW: Import for robust Google service account credential handling
 from google.oauth2 import service_account 
-
-# Note: Firebase imports and setup have been removed as they are not required for core functionality.
 
 # --- Configuration ---
 # Fetch credentials and configuration from environment variables
@@ -74,7 +70,7 @@ def update_google_sheet(user_id, session_data):
         return
 
     try:
-        # FIX 1: Use google.oauth2.service_account for robust credential creation
+        # Use google.oauth2.service_account for robust credential creation
         creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
         client = gspread.authorize(creds)
 
@@ -86,8 +82,9 @@ def update_google_sheet(user_id, session_data):
         session_id = session_data['Session_ID']
         
         try:
+            # Corrected exception name: gspread.CellNotFound
             cell = worksheet.find(session_id, in_column=1)
-        except gspread.CellNotFound: # FIX 2: Corrected exception name
+        except gspread.CellNotFound: 
             logging.error(f"Session ID {session_id} not found in sheet. Cannot end session.")
             return
 
@@ -123,7 +120,7 @@ def write_new_session_to_sheet(session_data):
         return
 
     try:
-        # FIX 1: Use google.oauth2.service_account for robust credential creation
+        # Use google.oauth2.service_account for robust credential creation
         creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
         client = gspread.authorize(creds)
         
@@ -170,14 +167,19 @@ async def check_user_presence(client, user_id):
         is_playing = presence['userPresenceType'] == 2 # 2 = InGame
         game_id = presence.get('universeId', 0) if is_playing else 0
         game_name = presence.get('lastLocation', 'Website / Offline')
+        user_name = presence.get('username', 'Unknown')
         
         if game_name == 'Website / Offline':
             is_playing = False 
             
+        # Defensive Fix: If user is playing but game name is empty, use a placeholder.
+        if is_playing and not game_name.strip():
+            game_name = "Unknown Game (Tracking Active)"
+            
         # If the user is marked 'InGame' but the game_id is 0/null (due to privacy settings or old game), 
         # we treat them as 'not playing' for tracking purposes, as we can't log the session without an ID.
         if is_playing and game_id == 0:
-            logging.warning(f"User {user_id} ({presence.get('username', 'Unknown')}) is 'InGame' but game_id is 0/null. Treating as Offline for tracking.")
+            logging.warning(f"User {user_name} ({user_id}) is 'InGame' but game_id is 0/null. Treating as Offline for tracking.")
             is_playing = False
 
         return {
@@ -185,7 +187,7 @@ async def check_user_presence(client, user_id):
             'is_playing': is_playing,
             'game_id': game_id,
             'game_name': game_name,
-            'user_name': presence.get('username', 'Unknown')
+            'user_name': user_name
         }
     except httpx.HTTPError as e:
         logging.error(f"HTTP error fetching presence for {user_id}: {e}")
@@ -200,31 +202,19 @@ async def run_presence_check():
     global user_session_cache
     
     current_time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    # datetime.now() will use the server's time, which should be configured to IST 
-    # via the TIMEZONE_NAME (Asia/Kolkata) env variable set by the platform.
     current_time_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
     
     # 1. Fetch data for all users concurrently
-    # Initialize results to an empty list to prevent the 'NoneType' error during iteration
     results = [] 
     try:
-        # This structure guarantees the tasks are created and awaited correctly within the client's lifecycle.
         async with httpx.AsyncClient(timeout=20) as client:
-            # Create a list of awaitable tasks
             tasks = [check_user_presence(client, uid) for uid in TARGET_USER_IDS]
-            
-            # Run all tasks concurrently and wait for all results
             results = await asyncio.gather(*tasks) 
     except Exception as e:
-        # If the entire fetch block fails (e.g., network issue), results remains []
         logging.error(f"Async data fetch failed entirely: {e}")
         
-    # --- DEFENSIVE CHECK ---
-    # Although results is initialized to [], this check provides extra safety
     if results is None: 
-        logging.error("Asyncio.gather returned None. Using empty list.")
         results = []
-    # -----------------------
 
     # 2. Process results
     for result in results: 
@@ -237,20 +227,22 @@ async def run_presence_check():
         
         was_playing = user_session_cache.get(cache_key, {}).get('Playing', False)
         
-        user_name = result['user_name']
-        logging.debug(f"Checking presence for {user_name} ({user_id})...")
+        # Log a descriptive name (ID if name is 'Unknown')
+        user_display_name = result['user_name'] if result['user_name'] != 'Unknown' else f"User {user_id}"
+        logging.debug(f"Checking presence for {user_display_name}...")
 
         # --- Transition Logic ---
 
         if is_playing_now and not was_playing:
             # START Session: User just started playing
             session_id = f"SESS_{int(time.time())}_{user_id}"
+            game_name = result['game_name']
             
             new_session_data = {
                 'Session_ID': session_id,
-                'User_Name': user_name,
+                'User_Name': result['user_name'],
                 'Roblox_ID': user_id,
-                'Game_Name': result['game_name'],
+                'Game_Name': game_name,
                 'Game_ID': result['game_id'],
                 'Start_Time_UTC': current_time_utc,
                 'Start_Time_Local': current_time_local,
@@ -259,11 +251,11 @@ async def run_presence_check():
             # Update cache
             user_session_cache[cache_key] = {
                 'Playing': True, 
-                'Game': result['game_name'],
+                'Game': game_name,
                 'Session_ID': session_id,
                 'Start_Time_UTC': current_time_utc
             }
-            logging.info(f"START Session: {user_name} in {result['game_name']}. ID: {session_id}")
+            logging.info(f"START Session: {result['user_name']} in {game_name}. ID: {session_id}")
 
             # Write to Google Sheet
             write_new_session_to_sheet(new_session_data)
@@ -273,9 +265,9 @@ async def run_presence_check():
             session_to_end = user_session_cache.get(cache_key, {})
             
             if not session_to_end.get('Session_ID'):
-                logging.warning(f"Attempted to end session for {user_name} but Session_ID was missing from cache.")
+                logging.warning(f"Attempted to end session for {user_display_name} but Session_ID was missing from cache.")
             else:
-                logging.debug(f"END Session: {user_name} left {session_to_end.get('Game', 'an unknown game')}.")
+                logging.debug(f"END Session: {user_display_name} left {session_to_end.get('Game', 'an unknown game')}.")
 
                 # Update Google Sheet with end time and duration
                 update_google_sheet(user_id, session_to_end)
@@ -286,14 +278,15 @@ async def run_presence_check():
         elif is_playing_now and was_playing:
             # CONTINUE Session: Still playing 
             session_id = user_session_cache[cache_key].get('Session_ID', 'N/A')
-            logging.debug(f"CONTINUE Session: {user_name} in {user_session_cache[cache_key]['Game']}: ID: {session_id}")
+            game_name = user_session_cache[cache_key]['Game']
+            logging.debug(f"CONTINUE Session: {user_display_name} in {game_name}: ID: {session_id}")
 
         else:
             # IDLE: Still offline/on website
-            logging.debug(f"IDLE: {user_name} is offline/on website.")
+            logging.debug(f"IDLE: {user_display_name} is offline/on website.")
             user_session_cache[cache_key] = {'Playing': False, 'Game': 'Website / Offline'}
             
-        logging.debug(f"Cache Updated: {user_name} -> Playing: {user_session_cache[cache_key]['Playing']}, Game: {user_session_cache[cache_key]['Game']}")
+        logging.debug(f"Cache Updated: {user_display_name} -> Playing: {user_session_cache[cache_key]['Playing']}, Game: {user_session_cache[cache_key]['Game']}")
 
 # --- Flask Routes ---
 
@@ -306,7 +299,6 @@ def track_sessions():
     logging.info(f"Received request to /track endpoint.")
     try:
         # Since Flask is synchronous, we run the async code in a synchronous context.
-        # This is where the whole async process starts.
         asyncio.run(run_presence_check())
         
         return jsonify({"status": "success", "message": "Tracking completed."}), 200
