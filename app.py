@@ -1,11 +1,12 @@
 import logging
 import json
+import os # <-- NEW: Import for reading environment variables
 import time
 import requests
 from flask import Flask, request
 from datetime import datetime, timedelta
-# Import service_account from gspread for sheets interaction
-from gspread import service_account
+# UPDATED: Import both service_account (for file fallback) and service_account_from_dict (for env var)
+from gspread import service_account, service_account_from_dict 
 
 # --- Configuration and Initialization ---
 
@@ -34,6 +35,9 @@ ROBLOX_USER_MAP = {
 SHEET_NAME = "Roblox Tracker Log" # Replace with your actual Sheet Name if different
 WORKSHEET_NAME = "Sheet1" # Replace with your actual Worksheet Name if different
 
+# Configuration Constants
+ENV_VAR_CREDS_NAME = 'GOOGLE_CREDENTIALS' # The name of your environment variable (updated)
+
 def load_config():
     """Simulates loading configuration and sets necessary global variables."""
     global config
@@ -42,24 +46,53 @@ def load_config():
     config['SHEET_NAME'] = SHEET_NAME
     config['WORKSHEET_NAME'] = WORKSHEET_NAME
     
-    # Assuming 'SHEETS_CREDENTIALS_PATH' is available locally or managed by the environment
-    config['SHEETS_CREDENTIALS_PATH'] = 'google-creds.json' 
+    # Keeping the file path for completeness, but environment variable takes priority
+    config['SHEETS_CREDENTIALS_PATH'] = 'YOUR_CREDS_FILE_NAME.json' 
     
     logging.info("Internal configuration loaded.")
     return True
 
 def init_sheet_client():
-    """Initializes the Google Sheets client using service account credentials."""
+    """
+    Initializes the Google Sheets client, prioritizing credentials from 
+    the environment variable or falling back to a file.
+    """
     global sheet_client
-    try:
-        # We rely on the service_account function to find and use the credentials file
-        creds_path = config['SHEETS_CREDENTIALS_PATH']
-        sheet_client = service_account(filename=creds_path)
-        logging.info("Google Sheets client initialized successfully.")
-    except Exception as e:
-        # This critical log helps immediately identify if the credential file is missing or invalid
-        logging.critical(f"Failed to initialize Google Sheets client (check 'google-creds.json' path/permissions): {e}")
-        sheet_client = None
+    
+    # 1. Try to load credentials from an environment variable (JSON string)
+    creds_json_str = os.environ.get(ENV_VAR_CREDS_NAME)
+    
+    if creds_json_str:
+        logging.info(f"Attempting to initialize Sheets client from environment variable: '{ENV_VAR_CREDS_NAME}'")
+        try:
+            creds_dict = json.loads(creds_json_str)
+            # Use service_account_from_dict for environment variable credentials
+            sheet_client = service_account_from_dict(creds_dict)
+            logging.info("Google Sheets client initialized successfully from environment variable.")
+            return
+
+        except json.JSONDecodeError as e:
+            # Critical error if the environment variable exists but is not valid JSON
+            logging.critical(f"Failed to decode environment variable '{ENV_VAR_CREDS_NAME}': {e}. Ensure it is a raw JSON string.")
+        except Exception as e:
+            logging.critical(f"Failed to initialize Sheets client from environment variable: {e}")
+
+
+    # 2. Fallback to file-based credentials (original logic)
+    creds_path = config.get('SHEETS_CREDENTIALS_PATH')
+    # Only try file path if the environment variable was not found/failed and the path isn't the placeholder
+    if creds_path and creds_path != 'YOUR_CREDS_FILE_NAME.json':
+        logging.info(f"Environment variable not available. Falling back to file path: '{creds_path}'")
+        try:
+            sheet_client = service_account(filename=creds_path)
+            logging.info("Google Sheets client initialized successfully from file.")
+        except Exception as e:
+            # This critical log helps immediately identify if the credential file is missing or invalid
+            logging.critical(f"Failed to initialize Google Sheets client from file: {e}")
+            sheet_client = None
+    else:
+        if not sheet_client: # Only log if initialization failed
+            logging.critical(f"Failed to initialize Google Sheets client. Neither environment variable ('{ENV_VAR_CREDS_NAME}') nor valid file path was provided.")
 
 
 # --- Roblox API Interactions ---
@@ -98,7 +131,13 @@ def get_game_details(presence):
     is_playing = presence.get('userPresenceType') == 2
     
     if is_playing:
-        game_name = presence.get('lastLocation', 'In Game (Name Hidden)')
+        location = presence.get('lastLocation')
+        
+        # Check if lastLocation is a meaningful string. If it's None, or an empty string, use default.
+        if location and location.strip():
+            game_name = location
+        else:
+            game_name = 'In Game (Name Hidden or Private)' # Updated default name
         
         # Try to find any available ID. Roblox uses placeId, rootPlaceId, or universeId.
         # We prioritize the most specific ID that is not None or 0.
@@ -217,6 +256,7 @@ def check_presence_and_update_cache():
         # --- Transition Logic ---
         
         # Check if the session should end (left game OR switched games)
+        # Note: We track by game_id for switches, as the name might change, but the ID should be stable.
         should_end_session = (cached_data['playing'] and not is_playing) or \
                              (cached_data['playing'] and is_playing and cached_data['game_id'] != game_id)
         
