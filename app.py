@@ -7,8 +7,10 @@ import httpx
 from flask import Flask, jsonify, request
 import gspread
 from firebase_admin import initialize_app, firestore, credentials
-import asyncio # New import for asyncio.gather
-import traceback # New import for better error logging
+import asyncio 
+import traceback 
+# Import modules for explicit timezone handling (if available, relying on system TZ otherwise)
+# from zoneinfo import ZoneInfo # Standard in Python 3.9+
 
 # --- Configuration ---
 # Fetch credentials and configuration from environment variables
@@ -16,10 +18,10 @@ try:
     # Use environment variable for service account credentials
     SERVICE_ACCOUNT_INFO = json.loads(os.environ.get("GOOGLE_CREDENTIALS"))
     SHEET_KEY = os.environ.get("SHEET_KEY")
-    TIMEZONE_NAME = os.environ.get("TIMEZONE", "America/New_York")
+    # Set default local timezone to IST (India Standard Time)
+    TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Kolkata") 
     PORT = int(os.environ.get("PORT", 8080))
     # Cache and Users
-    # IMPORTANT: Initialize cache with an empty dictionary if the env var isn't set or is invalid
     cache_str = os.environ.get("ROBLOX_CACHE", '{}')
     ROBLOX_CACHE = json.loads(cache_str) if cache_str else {}
 except Exception as e:
@@ -61,6 +63,7 @@ TARGET_USER_IDS = [
 def get_session_duration(start_time_utc):
     """Calculates the duration in minutes from a UTC start time to the current time."""
     try:
+        # Ensure the start time string is correctly parsed as UTC
         start_dt = datetime.fromisoformat(start_time_utc.replace(" UTC", "+00:00")).astimezone(timezone.utc)
         current_dt = datetime.now(timezone.utc)
         duration_seconds = (current_dt - start_dt).total_seconds()
@@ -90,15 +93,23 @@ def update_google_sheet(user_id, session_data):
 
         # Prepare end time and duration data
         current_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        
+        # Calculate local end time using the configured TIMEZONE_NAME
+        # We rely on the system/environment configuration to interpret datetime.now() 
+        # based on the TIMEZONE environment variable set in Render.
+        current_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
         duration = get_session_duration(session_data['Start_Time_UTC'])
         
-        # Data to update: End Time (G), Duration (H)
-        end_time_col = 7
+        # Data to update: End Time (G), Duration (H), End Time Local (J)
+        end_time_utc_col = 7
         duration_col = 8
+        end_time_local_col = 10
         
         # Update cells
-        worksheet.update_cell(cell.row, end_time_col, current_utc)
+        worksheet.update_cell(cell.row, end_time_utc_col, current_utc)
         worksheet.update_cell(cell.row, duration_col, duration)
+        worksheet.update_cell(cell.row, end_time_local_col, current_local)
         
         logging.info(f"Session {session_id} ended. Duration: {duration} mins.")
         
@@ -130,7 +141,7 @@ def write_new_session_to_sheet(session_data):
             session_data['Game_Name'],
             session_data['Game_ID'],
             session_data['Start_Time_UTC'],
-            '', # End Time (G) - Left blank until session ends
+            '', # End Time UTC (G) - Left blank until session ends
             '', # Duration (H) - Left blank until session ends
             session_data['Start_Time_Local'],
             ''  # End Time Local (J) - Left blank until session ends
@@ -185,17 +196,31 @@ async def run_presence_check():
     global user_session_cache
     
     current_time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    current_time_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # datetime.now() will use the server's time, which should be configured to IST 
+    # via the TIMEZONE_NAME (Asia/Kolkata) env variable set by the platform.
+    current_time_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
     
     # 1. Fetch data for all users concurrently
-    # This structure guarantees the tasks are created and awaited correctly within the client's lifecycle.
-    async with httpx.AsyncClient(timeout=20) as client:
-        # Create a list of awaitable tasks
-        tasks = [check_user_presence(client, uid) for uid in TARGET_USER_IDS]
+    # Initialize results to an empty list to prevent the 'NoneType' error during iteration
+    results = [] 
+    try:
+        # This structure guarantees the tasks are created and awaited correctly within the client's lifecycle.
+        async with httpx.AsyncClient(timeout=20) as client:
+            # Create a list of awaitable tasks
+            tasks = [check_user_presence(client, uid) for uid in TARGET_USER_IDS]
+            
+            # Run all tasks concurrently and wait for all results
+            results = await asyncio.gather(*tasks) 
+    except Exception as e:
+        # If the entire fetch block fails (e.g., network issue), results remains []
+        logging.error(f"Async data fetch failed entirely: {e}")
         
-        # Run all tasks concurrently and wait for all results
-        # This is the line that will now correctly return a list of results, fixing the 'NoneType' error.
-        results = await asyncio.gather(*tasks) 
+    # --- DEFENSIVE CHECK ---
+    # Although results is initialized to [], this check provides extra safety
+    if results is None: 
+        logging.error("Asyncio.gather returned None. Using empty list.")
+        results = []
+    # -----------------------
 
     # 2. Process results
     for result in results: 
