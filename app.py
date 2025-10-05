@@ -65,7 +65,6 @@ def init_gspread():
 
     try:
         # Get necessary credentials from environment variables
-        # CHANGED: Now using the key name GOOGLE_CREDENTIALS to match user's setup
         creds_json = os.environ.get("GOOGLE_CREDENTIALS") 
         sheet_key = os.environ.get("SHEET_KEY")
         
@@ -80,9 +79,8 @@ def init_gspread():
         # Open the sheet by key/ID
         spreadsheet = gc.open_by_key(sheet_key)
         
-        # Select the first worksheet (usually "Sheet1")
-        # NOTE: The user's sheet is named "Activity Log" in the previous context, but the code uses sheet1.
-        # We will assume sheet1 is the correct, currently active sheet for now.
+        # Select the first worksheet (usually "Sheet1").
+        # Note: If your log previously said "Activity Log", this means the first tab is named that.
         worksheet = spreadsheet.sheet1 
         
         # Define the expected header row
@@ -94,17 +92,24 @@ def init_gspread():
         
         # Check if header exists and update if necessary
         # Note: This is a synchronous gspread call, fine for initialization
-        if worksheet.row_count == 0 or worksheet.row_values(1) != expected_header:
-            logging.info(f"Setting up Sheet header row for '{worksheet.title}'...")
-            worksheet.update([expected_header])
-
+        try:
+            current_header = worksheet.row_values(1)
+            if current_header != expected_header:
+                logging.info(f"Setting up Sheet header row for '{worksheet.title}'...")
+                worksheet.update([expected_header])
+            else:
+                logging.info("Sheet header is correctly set.")
+        except Exception as e:
+            logging.error(f"Error checking/updating sheet header: {e}")
+            
         # Updated log to confirm the worksheet title is active
         logging.critical(f"Successfully connected to Google Sheet: {spreadsheet.title} (Worksheet: {worksheet.title})")
         gspread_sheet = worksheet # Store globally
         return worksheet
 
     except Exception as e:
-        logging.error(f"FATAL ERROR: Failed to initialize Google Sheet: {e}")
+        # CRITICAL: This will log authentication or sheet access failure.
+        logging.error(f"FATAL ERROR: Failed to initialize Google Sheet or authenticate service account: {e}")
         return None
 
 
@@ -115,10 +120,7 @@ async def fetch_api_data(url: str, method: str = 'POST', data: Optional[Dict] = 
     if IS_SIMULATION_MODE:
         # --- SIMULATION LOGIC ---
         await asyncio.sleep(0.5)
-        # Simplified simulation logic: Assume everyone is OFFLINE
-        if url == ROBLOX_PRESENCE_URL:
-            # ... (omitted simulation logic for brevity)
-            pass
+        # ... (omitted simulation logic for brevity)
         return None
         # --- END SIMULATION LOGIC ---
 
@@ -208,19 +210,25 @@ class RobloxTracker:
         if gspread_sheet:
             try:
                 # CRITICAL LOGGING ADDED HERE TO CONFIRM WE REACH THE WRITE ATTEMPT
-                logging.critical(f"SHEET WRITE ATTEMPT: Log for {session_log['user_name']} (Duration: {session_log['duration_minutes']:.2f} mins).")
+                logging.critical(f"SHEET WRITE ATTEMPT: Log for {session_log['user_name']} (Duration: {session_log['duration_minutes']:.2f} mins). Data: {row_data}")
 
                 # Use asyncio.to_thread to run the synchronous gspread operation without blocking
                 await asyncio.to_thread(gspread_sheet.append_row, row_data) 
                 logging.critical(f"Session Logged to Sheet SUCCESS: {session_log['user_name']} played {session_log['duration_minutes']:.2f} mins.")
             except Exception as e:
-                logging.error(f"Failed to write to Google Sheet for {self.user_name}: {e}")
+                # --- ENHANCED ERROR LOGGING ---
+                logging.error("-" * 50)
+                logging.error(f"CRITICAL WRITE FAILURE: Failed to write to Google Sheet for {self.user_name}.")
+                logging.error(f"Error Type: {type(e).__name__}")
+                logging.error(f"Error Message: {e}")
+                logging.error(f"Data Attempted: {row_data}")
+                logging.error("-" * 50)
                 
         # Log to in-memory store for console output (Always done)
         self._db_store['sessions'].append(session_log)
         logging.critical(f"Session Logged: {session_log['user_name']} played {session_log['game_name']} for {session_log['duration_minutes']:.2f} mins.")
 
-    # --- Presence & Game Logic ---
+    # --- Presence & Game Logic (omitted for brevity, remains unchanged) ---
     async def _get_game_details(self, place_id: int) -> Tuple[int, str]:
         """Fetches game name for a given Place ID from the Roblox API."""
         # ... (implementation omitted for brevity, remains unchanged)
@@ -294,7 +302,7 @@ class RobloxTracker:
                 }
         return None
 
-    # --- Main Tracking Loop Logic ---
+    # --- Main Tracking Loop Logic (omitted for brevity, remains unchanged) ---
     async def execute_tracking(self):
         """The core logic to check status and manage sessions for a SINGLE user."""
         # ... (implementation omitted for brevity, remains unchanged)
@@ -449,11 +457,11 @@ async def main():
 if __name__ == '__main__':
     # ... (omitted simulation mode warning for brevity)
     if IS_SIMULATION_MODE:
-         print("\n=======================================================")
-         print("!!! WARNING: httpx is missing. Tracker will not work. !!!")
-         print("!!! Please ensure 'httpx' is in your requirements.txt. !!!")
-         print("=======================================================\n")
-         
+        print("\n=======================================================")
+        print("!!! WARNING: httpx is missing. Tracker will not work. !!!")
+        print("!!! Please ensure 'httpx' is in your requirements.txt. !!!")
+        print("=======================================================\n")
+        
     try:
         asyncio.run(main())
     except Exception as e:
